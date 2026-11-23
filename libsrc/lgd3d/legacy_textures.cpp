@@ -8,6 +8,9 @@
 #include <rsdcfg.h>
 #include <vector>
 #include <material.h>
+#ifdef DARK_RT
+#include <render_rt.h>
+#endif
 
 constexpr int kPaletteSlots = 256;
 extern "C" {
@@ -283,6 +286,10 @@ extern "C" int LegacyTextureLoad(tdrv_texture_info *info) {
     return TDRV_FAILURE;
   if (g_legacyTextures[info->id])
     RenderBackendDestroyTexture(g_legacyTextures[info->id]);
+#ifdef DARK_RT
+  // (the path tracer: the image the texture is made from, for its materials)
+  RenderRTTextureSource(info->bm);
+#endif
   g_legacyTextures[info->id] =
       RenderBackendCreateTexture(info->w, info->h, pixels, info->w * 4);
   free(pixels);
@@ -298,6 +305,9 @@ extern "C" void LegacyTextureReload(tdrv_texture_info *info) {
   uchar *pixels = ConvertTexture(info);
   if (!pixels)
     return;
+#ifdef DARK_RT
+  RenderRTTextureSource(info->bm);
+#endif
   if (!RenderBackendUpdateTexture(g_legacyTextures[info->id], info->w, info->h,
                                 pixels, info->w * 4)) {
     if (g_legacyTextures[info->id]) {
@@ -307,6 +317,9 @@ extern "C" void LegacyTextureReload(tdrv_texture_info *info) {
       UnsetTextureId(info->id);
       RenderBackendDestroyTexture(g_legacyTextures[info->id]);
     }
+#ifdef DARK_RT
+    RenderRTTextureSource(info->bm);
+#endif
     g_legacyTextures[info->id] =
         RenderBackendCreateTexture(info->w, info->h, pixels, info->w * 4);
   }
@@ -444,3 +457,22 @@ extern "C" void *LegacyMaterialIllumination(const grs_bitmap *bitmap)
    }
    return texture;
 }
+
+#ifdef DARK_RT
+// The backend texture currently holding a bitmap, loading it through the
+// texture manager if it is not resident. The path tracer keeps its own copy of
+// every texture the backend has created, so the handle stays usable after the
+// texture manager swaps the bitmap out again.
+extern "C" void *lgd3d_rt_texture_for_bitmap(grs_bitmap *bm) {
+  if (!bm || !g_tmgr)
+    return NULL;
+  if (!(bm->flags & BMF_LOADED))
+    g_tmgr->load_texture(bm);
+  if (!(bm->flags & BMF_LOADED))
+    return NULL;
+  const int id = (int)(uintptr_t)bm->bits;
+  if (id < 0 || id >= LGD3D_MAX_TEXTURES || g_legacyBitmaps[id] != bm)
+    return NULL;
+  return g_legacyTextures[id];
+}
+#endif

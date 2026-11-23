@@ -9,6 +9,12 @@
 #include <cstdlib>
 #include <exception>
 
+#ifdef DARK_RT
+// The path tracer (rt/rtgl1.cpp): while it runs, the Vulkan scene renderer
+// is not started and these entry points forward to it.
+#include "rt/rt_backend_internal.h"
+#endif
+
 namespace
 {
 class cVulkanRenderBackend
@@ -50,6 +56,11 @@ public:
    }
 
    void Detach() { m_commandBuffer = nullptr; }
+   // the path tracer in the scene renderer's place (vulkan.cpp)
+   void SetPathTracer(bool active) { m_pathTracer = active; }
+   bool PathTracer() const { return m_pathTracer; }
+   // a renderer to draw with: the Vulkan scene renderer or the path tracer
+   bool Ready() const { return m_renderer || m_pathTracer; }
    bool SceneActive() const { return m_sceneActive; }
 
    void SetWindowMetrics(int clientWidth, int clientHeight,
@@ -100,7 +111,7 @@ public:
    }
 
    int UseLinearCanvasSampling() const { return m_scaleToWindow ? 1 : 0; }
-   int Available() const { return m_renderer != nullptr; }
+   int Available() const { return Ready() ? 1 : 0; }
    void SetGamma(float gamma)
    {
       if (!std::isfinite(gamma) || gamma <= 0.0f)
@@ -118,7 +129,7 @@ public:
 
    int GetClientSize(int *width, int *height) const
    {
-      if (!width || !height || !m_renderer ||
+      if (!width || !height || !Ready() ||
           m_clientWidth <= 0 || m_clientHeight <= 0)
          return 0;
       *width = m_clientWidth;
@@ -137,7 +148,7 @@ public:
 
    int ClientToLogicalPoint(int *x, int *y) const
    {
-      if (!x || !y || !m_renderer || m_width <= 0 || m_height <= 0 ||
+      if (!x || !y || !Ready() || m_width <= 0 || m_height <= 0 ||
           m_clientWidth <= 0 || m_clientHeight <= 0 ||
           m_drawableWidth <= 0 || m_drawableHeight <= 0)
          return 0;
@@ -159,7 +170,7 @@ public:
 
    int LogicalToClientPoint(int *x, int *y) const
    {
-      if (!x || !y || !m_renderer || m_width <= 0 || m_height <= 0 ||
+      if (!x || !y || !Ready() || m_width <= 0 || m_height <= 0 ||
           m_clientWidth <= 0 || m_clientHeight <= 0 ||
           m_drawableWidth <= 0 || m_drawableHeight <= 0)
          return 0;
@@ -179,6 +190,14 @@ public:
 
    int BeginScene()
    {
+#ifdef DARK_RT
+      if (m_pathTracer)
+      {
+         darkrt::BeginSceneFrame();
+         m_sceneActive = true;
+         return 1;
+      }
+#endif
       if (!m_renderer || !m_commandBuffer)
          return 0;
       if (!m_preserve)
@@ -191,7 +210,14 @@ public:
    }
 
    void PresentProgress() { DarkRenderPresentProgress(); }
-   void DeactivateScene() { m_sceneActive = false; }
+   void DeactivateScene()
+   {
+#ifdef DARK_RT
+      if (m_pathTracer)
+         darkrt::DeactivateScene();
+#endif
+      m_sceneActive = false;
+   }
 
    void ClearDepth()
    {
@@ -245,16 +271,36 @@ public:
 
    void SetDepth(bool compare, bool write)
    { if (m_renderer) m_renderer->SetDepth(compare, write); }
-   void SetBlend(int mode) { if (m_renderer) m_renderer->SetBlend(mode); }
+   void SetBlend(int mode)
+   {
+#ifdef DARK_RT
+      if (m_pathTracer) { darkrt::SetBlend(mode); return; }
+#endif
+      if (m_renderer) m_renderer->SetBlend(mode);
+   }
    void SetAlphaTest(bool enabled)
-   { if (m_renderer) m_renderer->SetAlphaTest(enabled); }
+   {
+#ifdef DARK_RT
+      if (m_pathTracer) { darkrt::SetAlphaTest(enabled ? 1 : 0); return; }
+#endif
+      if (m_renderer) m_renderer->SetAlphaTest(enabled);
+   }
    void SetSampler(int level, bool wrap, bool smooth)
    { if (m_renderer) m_renderer->SetSampler(level, wrap, smooth); }
    void SetFog(bool enabled, uint32_t rgb)
-   { if (m_renderer) m_renderer->SetFog(enabled, rgb); }
+   {
+#ifdef DARK_RT
+      if (m_pathTracer) { darkrt::SetFog(enabled ? 1 : 0, rgb); return; }
+#endif
+      if (m_renderer) m_renderer->SetFog(enabled, rgb);
+   }
 
    void *CreateTexture(int width, int height, const void *rgba, int rowBytes)
    {
+#ifdef DARK_RT
+      if (m_pathTracer)
+         return darkrt::CreateTexture(width, height, rgba, rowBytes);
+#endif
       return m_renderer
          ? m_renderer->CreateTexture(width, height, rgba, rowBytes) : nullptr;
    }
@@ -262,18 +308,43 @@ public:
    int UpdateTexture(void *texture, int width, int height,
       const void *rgba, int rowBytes)
    {
+#ifdef DARK_RT
+      if (m_pathTracer)
+         return darkrt::UpdateTexture(texture, width, height, rgba, rowBytes);
+#endif
       return m_renderer && m_renderer->UpdateTexture(texture, width, height,
          rgba, rowBytes);
    }
 
    void DestroyTexture(void *texture)
-   { if (m_renderer) m_renderer->DestroyTexture(texture); }
+   {
+#ifdef DARK_RT
+      if (m_pathTracer) { darkrt::DestroyTexture(texture); return; }
+#endif
+      if (m_renderer) m_renderer->DestroyTexture(texture);
+   }
    void BindTexture(int level, void *texture)
-   { if (m_renderer) m_renderer->BindTexture(level, texture); }
+   {
+#ifdef DARK_RT
+      if (m_pathTracer) { darkrt::BindTexture(level, texture); return; }
+#endif
+      if (m_renderer) m_renderer->BindTexture(level, texture);
+   }
 
    int Draw(int primitive, const sRenderBackendVertex *vertices,
       int vertexCount, bool useSecondTexture)
    {
+#ifdef DARK_RT
+      if (m_pathTracer)
+      {
+         // in canvas coordinates, placed in the drawable as the canvas is
+         int x, y, width, height;
+         GetViewport(m_width, m_height, m_drawableWidth, m_drawableHeight,
+            false, &x, &y, &width, &height);
+         return darkrt::Draw(primitive, vertices, vertexCount, m_width, m_height,
+            darkrt::Rect{float(x), float(y), float(width), float(height)});
+      }
+#endif
       if (!m_renderer || !m_commandBuffer)
          return 0;
       int x, y, width, height;
@@ -323,6 +394,7 @@ public:
 
 private:
    cVulkanSceneRenderer *m_renderer{};
+   bool m_pathTracer{};
    vk::CommandBuffer m_commandBuffer{};
    int m_width{};
    int m_height{};
@@ -383,6 +455,8 @@ void RenderBackendVulkanAttach(vk::CommandBuffer commandBuffer,
 }
 
 void RenderBackendVulkanDetach(void) { Backend().Detach(); }
+void RenderBackendVulkanSetPathTracer(int active)
+{ Backend().SetPathTracer(active != 0); }
 int RenderBackendVulkanSceneActive(void) { return Backend().SceneActive(); }
 int RenderBackendVulkanCanvasOverlayEnabled(void)
 { return Backend().CanvasOverlayEnabled(); }

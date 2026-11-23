@@ -7,6 +7,10 @@
 // code for multiple light source lighting
 
 #include <lg.h>
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+#include <ctype.h>
 #include <r3d.h>
 #include <mprintf.h>
 
@@ -504,6 +508,90 @@ float compute_object_lighting(ObjID o)
    return total;
 }
 
+// Guards seeing the player's shadow (a setting of the port, off unless
+// chosen: shadow_alert, in either renderer's panel).
+int g_PlayerShadowAlert = 0;
+
+// Where an object's shadow falls: the light that lights it most (the
+// game's own lights, as compute_object_lighting takes them -- the lights of
+// its cell that reach it, the moving ones by a raycast), straight on from
+// it away from that light to the first wall or floor (within 20 ft). Its
+// strength is that light on the object (compute_object_lighting's scale).
+// FALSE when nothing lights it or its shadow falls on nothing near.
+BOOL compute_object_shadow_spot(ObjID o, mxs_vector *spot, float *strength)
+{
+   Location dummy;
+   Position* pos = ObjPosGet(o);
+   Location *loc;
+   int cell, shadows, *shadPtr;
+   int i, num, k, inner_frac;
+   ushort *lt;
+   float best = 0.0f;
+   mxs_vector from;
+
+   if (!pos)
+      return FALSE;
+   loc = &pos->loc;
+   cell = CellFromLoc(loc);
+   if (cell == CELL_INVALID)
+      return FALSE;
+   lt = WR_CELL(cell)->light_indices;
+   num = num_light + num_dyn;
+   shadPtr = objGetShadows(o);
+   for (i = 0; i <= lt[0]; i += 32, shadPtr++)
+   {
+      if (i + 32 <= lt[0])
+         inner_frac = 32;
+      else
+         inner_frac = lt[0] & 0x1f;
+      for (k = 1, shadows = *shadPtr; k <= inner_frac; ++k, shadows >>= 1)
+         if (shadows & 1)
+         {
+            const float v = _apply_one_light(lt[i + k], loc);
+            if (v > best)
+            {
+               best = v;
+               from = light_data[lt[i + k]].loc;
+            }
+         }
+   }
+   for (i = num_light; i < num; ++i)
+   {
+      Location p;
+      MakeLocationFromVector(&p, &light_data[i].loc);
+      if (PortalRaycast(loc, &p, &dummy, 0) &&
+          ObjRaycastC(loc, &p, &dummy, TRUE, 0, 0, g_pObjShadowProp, FALSE) == kObjCastNone)
+      {
+         const float v = ml_multi_light_on_object(&light_data[i], &loc->vec);
+         if (v > best)
+         {
+            best = v;
+            from = light_data[i].loc;
+         }
+      }
+   }
+   if (best <= 0.02f)
+      return FALSE;
+   {
+      mxs_vector dir, end;
+      Location a, b, hit;
+      float len;
+      mx_sub_vec(&dir, &loc->vec, &from);
+      len = mx_mag_vec(&dir);
+      if (len < 0.01f)
+         return FALSE;
+      mx_scaleeq_vec(&dir, 1.0f / len);
+      mx_scale_add_vec(&end, &loc->vec, &dir, 20.0f);
+      MakeLocationFromVector(&a, &loc->vec);
+      MakeLocationFromVector(&b, &end);
+      if (PortalRaycast(&a, &b, &hit, 0))
+         return FALSE;   // (on nothing near)
+      mx_scale_add_vec(spot, &hit.vec, &dir, -0.5f);
+   }
+   *strength = best;
+   return TRUE;
+}
+
 
 #ifndef SHIP
 #include <objedit.h>
@@ -617,5 +705,71 @@ float blame_object_lighting(ObjID o)
    mprintf("Got lighting %g from %d vis lights, %d total lights\n",100.0*total,seen_index,lt[0]);
 
    return total;
+}
+#endif
+
+
+#ifdef DARK_RT
+#include <render_rt.h>
+extern int portal_rt_light_relevant(int light);
+extern float portal_rt_path_distance(int cell, const mxs_vector *pos);
+// Hand the object-light table to the ray tracer: every static and animated
+// light (their current brightness, as the game set it this frame) and this
+// frame's dynamic lights.  Brightness goes back to Dark's 0..255 scale.
+void objlight_rt_submit(void)
+{
+   int i, first = mission_uses_sunlight() ? FIRST_LIGHT : 0;
+   {
+      // the level's ambient light, which the game adds to every lightmap and
+      // model: a room whose lights are all out is dim, not black
+      const sMissionRenderParams *parms = GetMissionRenderParams();
+      if (parms)
+         RenderRTAmbient(parms->ambient_light.x, parms->ambient_light.y,
+                         parms->ambient_light.z);
+      // and a Thief 2 mission's sun, which its lightmaps have outdoors
+      if (parms && parms->use_sun) {
+         const float to[3] = { -parms->sunlight_vector.x, -parms->sunlight_vector.y,
+                               -parms->sunlight_vector.z };
+         const float rgb[3] = { parms->sun_rgb.x, parms->sun_rgb.y, parms->sun_rgb.z };
+         RenderRTSun(1, to, rgb, parms->sun_b);
+      } else
+         RenderRTSun(0, NULL, NULL, 0.0f);
+   }
+   for (i = first; i < num_light + num_dyn && i < MAX_STATIC; ++i)
+   {
+      const mls_multi_light *l = &light_data[i];
+      float pos[3], rgb[3], dir[3];
+#ifdef RGB_LIGHTING
+      rgb[0] = l->bright.x * light_scale;
+      rgb[1] = l->bright.y * light_scale;
+      rgb[2] = l->bright.z * light_scale;
+#else
+      rgb[0] = rgb[1] = rgb[2] = l->bright * light_scale;
+#endif
+      // (an unlit one too: the ray tracer leaves it out, its inspector lists it)
+      pos[0] = l->loc.x; pos[1] = l->loc.y; pos[2] = l->loc.z;
+      dir[0] = l->dir.x; dir[1] = l->dir.y; dir[2] = l->dir.z;
+      {
+         // the light's cell, found again only when it moves
+         static int cell_of[MAX_STATIC];
+         static mxs_vector cell_at[MAX_STATIC];
+         static unsigned char known[MAX_STATIC];
+         float walk;
+         if (!known[i] || cell_at[i].x != l->loc.x || cell_at[i].y != l->loc.y ||
+             cell_at[i].z != l->loc.z) {
+            Location loc;
+            MakeLocationFromVector(&loc, &l->loc);
+            cell_of[i] = CellFromLoc(&loc);
+            cell_at[i] = l->loc;
+            known[i] = 1;
+         }
+         // (a light in no cell, inside a wall: -2, the ray tracer measures it straight)
+         walk = cell_of[i] < 0 ? -2.0f : portal_rt_path_distance(cell_of[i], &l->loc);
+         RenderRTLight(i >= num_light ? 0x10000u + (uint32_t)(i - num_light) : (uint32_t)i,
+                       pos, rgb, l->radius, dir, l->inner, l->outer,
+                       i >= num_light || portal_rt_light_relevant(i),
+                       walk == -2.0f ? -2.0f : walk < 0.0f ? -1.0f : walk * 0.3048f);
+      }
+   }
 }
 #endif

@@ -8,6 +8,9 @@ void RenderBackendVulkanAttach(vk::CommandBuffer commandBuffer,
    int logicalWidth, int logicalHeight, int clientWidth, int clientHeight,
    int drawableWidth, int drawableHeight);
 void RenderBackendVulkanDetach(void);
+// The path tracer (rt/rtgl1.cpp) in the scene renderer's place: the backend's
+// drawing forwarded to it (DARK_RT builds).
+void RenderBackendVulkanSetPathTracer(int active);
 int RenderBackendVulkanSceneActive(void);
 int RenderBackendVulkanCanvasOverlayEnabled(void);
 void RenderBackendVulkanSetWindowMetrics(int clientWidth, int clientHeight,

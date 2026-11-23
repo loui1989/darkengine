@@ -25,6 +25,12 @@
 #include "vulkan_scene_renderer.hpp"
 #include "canvas_snapshot.hpp"
 #include <config.h>
+#ifdef DARK_RT
+// The path tracer (rt/rtgl1.cpp): THIEF_RT=1, and its library found, it takes
+// the window instead of the Vulkan renderer (cmake/RayTracing.cmake).
+#include "rt/rt_backend_internal.h"
+#include <SDL3/SDL.h>
+#endif
 
 namespace
 {
@@ -77,6 +83,13 @@ private:
    void DrawCanvas(vk::CommandBuffer commandBuffer, bool transparent);
 
    bool m_windowOpen{};
+#ifdef DARK_RT
+   bool OpenPathTracer();
+   void PathTracerPresent();
+   bool m_rt{};               // the path tracer has the window
+   bool m_rtPresentPending{}; // a canvas given to it, not yet shown
+   darkrt::Rect RTCanvasViewport() const;
+#endif
    cVulkanContext m_context;
    cVulkanSceneRenderer m_renderer;
    vk::CommandBuffer m_activeCommandBuffer{};
@@ -121,6 +134,24 @@ void cVulkanRuntime::UpdateWindowDimensions()
    const int oldWidth = m_clientWidth, oldHeight = m_clientHeight;
    const int oldDrawableWidth = m_drawableWidth;
    const int oldDrawableHeight = m_drawableHeight;
+#ifdef DARK_RT
+   if (m_rt)
+   {
+      // (the frame's pixels: the path tracer's output resolution setting's)
+      darkrt::ApplyOutputSize();
+      int pw = 0, ph = 0;
+      SDLDisplayGetWindowMetrics(&m_clientWidth, &m_clientHeight, &pw, &ph);
+      darkrt::DrawableSize(&m_drawableWidth, &m_drawableHeight);
+      if (m_drawableWidth <= 0 || m_drawableHeight <= 0)
+         m_drawableWidth = pw, m_drawableHeight = ph;
+      if (m_clientWidth > 0 && m_clientHeight > 0 &&
+          (m_clientWidth != oldWidth || m_clientHeight != oldHeight))
+         m_windowSizeChanged = true;
+      RenderBackendVulkanSetWindowMetrics(m_clientWidth, m_clientHeight,
+         m_drawableWidth, m_drawableHeight);
+      return;
+   }
+#endif
    SDLDisplayGetWindowMetrics(&m_clientWidth, &m_clientHeight,
       &m_drawableWidth, &m_drawableHeight);
    if (m_clientWidth > 0 && m_clientHeight > 0 &&
@@ -336,6 +367,11 @@ bool cVulkanRuntime::Open(int width, int height, const char *title)
       UpdateWindowDimensions();
       return true;
    }
+#ifdef DARK_RT
+   // the path tracer: a Metal window on macOS
+   const bool rtWanted = darkrt::Wanted();
+   SDLDisplayUseMetalWindow(rtWanted);
+#endif
    if (!SDLDisplayOpenWindow(width, height, title))
    {
       return false;
@@ -345,6 +381,21 @@ bool cVulkanRuntime::Open(int width, int height, const char *title)
    m_windowMinimized.store(false, std::memory_order_relaxed);
    m_lifecycleResizePending.store(false, std::memory_order_relaxed);
    m_width = width; m_height = height;
+#ifdef DARK_RT
+   if (rtWanted)
+   {
+      if (OpenPathTracer())
+         return true;
+      // (it would not start: the Vulkan renderer, in a window of its own kind)
+      SDLDisplayCloseWindow();
+      SDLDisplayUseMetalWindow(false);
+      if (!SDLDisplayOpenWindow(width, height, title))
+      {
+         m_windowOpen = false;
+         return false;
+      }
+   }
+#endif
    UpdateWindowDimensions();
    char error[512]{};
    std::vector<const char *> surfaceExtensions;
@@ -438,6 +489,22 @@ bool cVulkanRuntime::Open(int width, int height, const char *title)
 
 void cVulkanRuntime::Close()
 {
+#ifdef DARK_RT
+   if (m_rt)
+   {
+      RenderBackendVulkanDetach();
+      RenderBackendVulkanSetPathTracer(0);
+      darkrt::Close();
+      m_rt = false;
+      m_rtPresentPending = false;
+      m_frameActive = false;
+      SDLDisplayCloseWindow();
+      m_windowOpen = false;
+      m_width = m_height = m_clientWidth = m_clientHeight = 0;
+      m_drawableWidth = m_drawableHeight = 0;
+      return;
+   }
+#endif
    if (m_frameActive)
    {
       RenderBackendVulkanDetach();
@@ -558,6 +625,19 @@ void cVulkanRuntime::BeginApplicationFrame()
       m_directCanvas = false;
    }
    ProcessPendingLifecycleResize();
+#ifdef DARK_RT
+   if (m_rt)
+   {
+      if (!m_windowOpen || m_frameActive)
+         return;
+      UpdateWindowDimensions();
+      // (no command buffer: the backend's sizes, its drawing to the path tracer)
+      RenderBackendVulkanAttach(nullptr, m_width, m_height, m_clientWidth,
+         m_clientHeight, m_drawableWidth, m_drawableHeight);
+      m_frameActive = true;
+      return;
+   }
+#endif
    if (!m_windowOpen || m_frameActive ||
        m_windowMinimized.load(std::memory_order_acquire) ||
        m_drawableWidth <= 0 || m_drawableHeight <= 0)
@@ -583,6 +663,16 @@ void cVulkanRuntime::EndApplicationFrame()
 {
    ZoneScopedN("Vulkan present");
    if (!m_frameActive) return;
+#ifdef DARK_RT
+   if (m_rt)
+   {
+      PathTracerPresent();
+      RenderBackendDeactivateScene();
+      RenderBackendVulkanDetach();
+      m_frameActive = false;
+      return;
+   }
+#endif
    if (!PrepareCanvasTexture())
       std::fprintf(stderr, "Vulkan canvas texture update failed\n");
    DrawCanvas(m_activeCommandBuffer, RenderBackendVulkanSceneActive() != 0);
@@ -625,6 +715,22 @@ void cVulkanRuntime::Present(const void *pixels, int width, int height, int rowB
 void cVulkanRuntime::PresentRect(const void *pixels, int width, int height,
    int rowBytes, int depth, const uint8_t *palette, int x0, int y0, int x1, int y1)
 {
+#ifdef DARK_RT
+   if (m_rt)
+   {
+      // the whole canvas (the path tracer converts only the rows that changed)
+      if (!pixels) return;
+      m_width = width;
+      m_height = height;
+      darkrt::SetCanvas(pixels, width, height, rowBytes, depth, palette,
+         RenderBackendVulkanSceneActive() != 0, RTCanvasViewport());
+      m_rtPresentPending = true;
+      // out of a frame (a menu's, the loading screen's): shown now
+      if (!m_frameActive)
+         PathTracerPresent();
+      return;
+   }
+#endif
    m_directCanvas = false;
    CaptureCanvas(pixels, width, height, rowBytes, depth, palette, x0, y0, x1, y1);
 }
@@ -643,6 +749,10 @@ void cVulkanRuntime::InvalidateCanvas()
 bool cVulkanRuntime::PresentCanvasRect(const void *pixels, int width, int height,
    int rowBytes, int depth, const uint8_t *palette, int x0, int y0, int x1, int y1)
 {
+#ifdef DARK_RT
+   if (m_rt)
+      return false;   // (the canvas goes by Present: PresentRect)
+#endif
    // Preserve the legacy visible-canvas path for menus, software rendering,
    // retained editor panes, and out-of-frame progress updates.
    if (!m_frameActive || !RenderBackendVulkanSceneActive() || RenderBackendPreserveCanvas())
@@ -656,6 +766,10 @@ bool cVulkanRuntime::PresentCanvasRect(const void *pixels, int width, int height
 bool cVulkanRuntime::ClearOverlay(void *pixels, int width, int height,
    int rowBytes, int depth)
 {
+#ifdef DARK_RT
+   if (m_rt)
+      return false;
+#endif
    const bool eligible = m_overlayClearEligible;
    m_overlayClearEligible = false;
    return eligible && pixels == m_canvasSource &&
@@ -677,6 +791,21 @@ bool cVulkanRuntime::PresentMovieFrame(const void *rgba, int width, int height,
           (maxSize - pixelStride) / sourceStride))
       return false;
 
+#ifdef DARK_RT
+   if (m_rt)
+   {
+      // letterboxed at the movie's own aspect
+      UpdateWindowDimensions();
+      const int dw = m_drawableWidth, dh = m_drawableHeight;
+      if (dw <= 0 || dh <= 0)
+         return false;
+      float vw = float(dw), vh = float(dh);
+      const float aspect = float(width) / float(height);
+      if (vw / vh > aspect) vw = vh * aspect; else vh = vw / aspect;
+      const darkrt::Rect vp{(dw - vw) * 0.5f, (dh - vh) * 0.5f, vw, vh};
+      return darkrt::MovieFrame(rgba, width, height, rowBytes, vp, dw, dh);
+   }
+#endif
    std::vector<uint8_t> pixels;
    try
    {
@@ -774,6 +903,46 @@ bool cVulkanRuntime::PresentMovieFrame(const void *rgba, int width, int height,
    return began && drew;
 }
 
+#ifdef DARK_RT
+bool cVulkanRuntime::OpenPathTracer()
+{
+   SDL_Window *window = SDLDisplayGetWindow();
+   if (!window || !darkrt::Open(window))
+      return false;
+   m_rt = true;
+   RenderBackendVulkanSetPathTracer(1);
+   UpdateWindowDimensions();
+   if (!m_exitHookRegistered)
+   {
+      std::atexit(DarkRenderClose);
+      m_exitHookRegistered = true;
+   }
+   m_windowMinimized = SDLDisplayWindowIsMinimized();
+   std::fprintf(stderr, "Path tracer started in the window (%dx%d points, %dx%d pixels)\n",
+      m_clientWidth, m_clientHeight, m_drawableWidth, m_drawableHeight);
+   return true;
+}
+
+// The canvas placed in the drawable as the Vulkan renderer places it
+darkrt::Rect cVulkanRuntime::RTCanvasViewport() const
+{
+   int x, y, w, h;
+   RenderBackendVulkanGetViewport(m_width, m_height, m_drawableWidth,
+      m_drawableHeight, 1, &x, &y, &w, &h);
+   return darkrt::Rect{float(x), float(y), float(w), float(h)};
+}
+
+void cVulkanRuntime::PathTracerPresent()
+{
+   if (!m_rtPresentPending || darkrt::FrameInProgress())
+      return;
+   int vsync = 1;
+   config_get_int("vsync", &vsync);
+   darkrt::Present(m_drawableWidth, m_drawableHeight, vsync != 0);
+   m_rtPresentPending = false;
+}
+#endif
+
 }
 
 bool DarkRenderOpen(int width, int height, const char *title)
@@ -833,3 +1002,15 @@ void DarkRenderPresentRect(const void *pixels, int width, int height,
 }
 void DarkRenderInvalidateCanvas()
 { VulkanRuntime().InvalidateCanvas(); }
+
+// The path tracer's settings panel (Cmd+, or F10): true if the key was its
+// own and must not reach the game.
+bool DarkRenderHandleKey(int scancode, int mods, bool down, bool repeat)
+{
+#ifdef DARK_RT
+   if (darkrt::Active())
+      return darkrt::HandleKey(scancode, mods, down, repeat);
+#endif
+   (void)scancode; (void)mods; (void)down; (void)repeat;
+   return false;
+}

@@ -7,6 +7,8 @@
 #include <r3d.h>
 #include <mmd.h>
 #include <string.h>
+// r3d/block.c: set while the ray tracer captures a model whole
+extern int r3d_rt_noclip, r3d_rt_backface;
 
 // global variables
 int current_smatr_id=-1;
@@ -795,8 +797,13 @@ void mm_render_pgon_block(mms_pgon *pgons, int num)
    {
       // Bail if it isn't facing you
       // use the cached normal dot prod
-      if ((mmd_buff_norms[p->norm] + p->d) <= 0.0)
-         continue;
+      // (not while the ray tracer captures the model whole)
+      if ((mmd_buff_norms[p->norm] + p->d) <= 0.0) {
+         if (!r3d_rt_noclip)
+            continue;
+         r3d_rt_backface = 1;
+      } else
+         r3d_rt_backface = 0;
     
       // set context if material has changed
       if(p->smatr_id!=current_smatr_id)
@@ -831,8 +838,13 @@ static void mm_render_pgon_smatr_block(mms_pgon *pgons,int num)
    {
       // Bail if it isn't facing you
       // use the cached normal dot prod
-      if ((mmd_buff_norms[p->norm] + p->d) <= 0.0)
-         continue;
+      // (not while the ray tracer captures the model whole)
+      if ((mmd_buff_norms[p->norm] + p->d) <= 0.0) {
+         if (!r3d_rt_noclip)
+            continue;
+         r3d_rt_backface = 1;
+      } else
+         r3d_rt_backface = 0;
 
 #ifdef DBG_ON
       if(use_debug)

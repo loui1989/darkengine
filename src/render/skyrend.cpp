@@ -5,7 +5,11 @@
 
 // $Header: r:/t2repos/thief2/src/render/skyrend.cpp,v 1.11 2000/02/19 12:35:46 toml Exp $
 
+#include <stdio.h>
 #include <skyrend.h>
+#ifdef DARK_RT
+#include <render_rt.h>
+#endif
 #include <skyint.h>
 #include <skyobj.h>
 #include <starobj.h>
@@ -128,6 +132,10 @@ void SkyRendererRender()
 
    while (RenderedComponents[i])
    {
+#ifdef DARK_RT
+      // (the path tracer's sky keeps the parts in this order: RenderRTSkyLayer)
+      RenderRTSkyLayer(i);
+#endif
       RenderedComponents[i]->Render();
       i++;
    }
@@ -166,6 +174,17 @@ float SkyRendererGetHorizonDip()
 float SkyRendererGetSkyIntensity(mxs_vector *pDir)
 {
    return SkyRenderer.GetSkyIntensity(pDir);
+}
+
+// the first of the mission's celestial objects (its moon), for the path
+// tracer's moonlight
+BOOL SkyRendererGetCelestialDir(float dir[3])
+{
+   if (!SkyRendererUseEnhanced())
+      return FALSE;
+   return CelestialObjectRenderer1.GetDirection(dir) ||
+          CelestialObjectRenderer2.GetDirection(dir) ||
+          CelestialObjectRenderer3.GetDirection(dir);
 }
 
 float SkyRendererGetSkyDist(mxs_vector *pDir)

@@ -32,8 +32,13 @@ public:
       }
       m_sdlInitialized = true;
 
+#if defined(__APPLE__)
+      const SDL_WindowFlags graphics = m_metal ? SDL_WINDOW_METAL : SDL_WINDOW_VULKAN;
+#else
+      const SDL_WindowFlags graphics = SDL_WINDOW_VULKAN;
+#endif
       m_window = SDL_CreateWindow(title ? title : "Dark Engine", width, height,
-         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
+         graphics | SDL_WINDOW_RESIZABLE |
          SDL_WINDOW_HIGH_PIXEL_DENSITY);
       if (!m_window)
       {
@@ -149,7 +154,10 @@ public:
       return m_window && (SDL_GetWindowFlags(m_window) & flag) != 0;
    }
 
+   void SetMetal(bool metal) { m_metal = metal; }
+
 private:
+   bool m_metal{};
    void UpdateRelativeMouse()
    {
       if (!m_window)
@@ -192,6 +200,7 @@ bool SDLDisplayOpenWindow(int width, int height, const char *title)
 { return DisplayWindow().Open(width, height, title); }
 
 void SDLDisplayCloseWindow(void) { DisplayWindow().Close(); }
+void SDLDisplayUseMetalWindow(bool metal) { DisplayWindow().SetMetal(metal); }
 SDL_Window *SDLDisplayGetWindow(void) { return DisplayWindow().Get(); }
 SDL_WindowID SDLDisplayGetWindowId(void) { return DisplayWindow().GetId(); }
 

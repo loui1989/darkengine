@@ -4,6 +4,8 @@
 struct SDL_Window;
 
 bool SDLDisplayOpenWindow(int width, int height, const char *title);
+// The next window made for Metal, not Vulkan (macOS: the path tracer's)
+void SDLDisplayUseMetalWindow(bool metal);
 void SDLDisplayCloseWindow(void);
 SDL_Window *SDLDisplayGetWindow(void);
 void SDLDisplayGetWindowMetrics(int *clientWidth, int *clientHeight,

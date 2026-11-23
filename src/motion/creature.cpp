@@ -640,6 +640,119 @@ void CreaturePosPropUnlock()
    gCrPosPropLock--;
 }
 
+#ifdef DARK_RT
+// A creature whose pose is reshaped after each update, once its motion has
+// set its joints (CreatureSetPoseHook): Garrett's body double, crouching
+static ObjID g_CrPoseHookObj = OBJ_NULL;
+static tCreaturePoseHook g_CrPoseHook = NULL;
+// (its motion's own relative orientations, put back before its next update:
+// the motion library blends a transition from them -- reshaped, the next
+// reshaping went on top of the last)
+static quat g_CrPoseRelWas[65];
+static BOOL g_CrPoseRelSaved = FALSE;
+// (its joints as the hook left them -- in its own frame, about its butt:
+// moved or turned since (each frame, put where Garrett is), the same pose --
+// one reshaped already is not again: twice, it crouched twice as deep for a
+// frame each time its walk came round)
+static mxs_vector g_CrPoseOut[64];
+static quat g_CrPoseRelOut[65];
+static int g_CrPoseOutN = 0;
+
+static int g_CrPoseApplied = 0;   // (how many times, for the double's log)
+
+int CreaturePoseApplied()
+{
+   return g_CrPoseApplied;
+}
+
+static void CrPoseBodyFrame(const multiped *mp, mxs_vector *out)
+{
+   for (int j = 0; j < mp->num_joints; ++j)
+   {
+      mxs_vector d;
+      mx_sub_vec(&d, &mp->joints[j], &mp->global_pos);
+      mx_mat_tmul_vec(&out[j], &mp->global_orient, &d);
+   }
+}
+
+static BOOL CrPoseIsOut(const multiped *mp)
+{
+   if (g_CrPoseOutN != mp->num_joints)
+      return FALSE;
+   mxs_vector now[64];
+   CrPoseBodyFrame(mp, now);
+   for (int j = 0; j < mp->num_joints; ++j)
+   {
+      mxs_vector d;
+      mx_sub_vec(&d, &now[j], &g_CrPoseOut[j]);
+      if (mx_mag2_vec(&d) > 0.01f * 0.01f)
+         return FALSE;
+   }
+   return TRUE;
+}
+
+static void CrPoseApply(ObjID obj, multiped *mp, const int *parents)
+{
+   ++g_CrPoseApplied;
+   memcpy(g_CrPoseRelWas, mp->rel_orients, sizeof(quat) * (mp->num_joints + 1));
+   g_CrPoseRelSaved = TRUE;
+   g_CrPoseHook(obj, mp->num_joints, mp->joints, mp->orients, mp->rel_orients, parents);
+   CrPoseBodyFrame(mp, g_CrPoseOut);
+   memcpy(g_CrPoseRelOut, mp->rel_orients, sizeof(quat) * (mp->num_joints + 1));
+   g_CrPoseOutN = mp->num_joints;
+}
+
+void CreaturePoseReapply(ObjID obj)
+{
+   if (obj != g_CrPoseHookObj || !g_CrPoseHook)
+      return;
+   cCreature *pCreature = CreatureFromObj(obj);
+   multiped *mp = pCreature ? (multiped *)pCreature->GetMultiped() : NULL;
+   if (!mp || !mp->joints || !mp->orients || !mp->rel_orients || mp->num_joints >= 64)
+      return;
+   if (CrPoseIsOut(mp))
+   {
+      // (its joints as reshaped: its relative orientations, put back for
+      // the new maneuver, as reshaped too -- the mesh's stretchy parts)
+      if (!g_CrPoseRelSaved)
+      {
+         memcpy(mp->rel_orients, g_CrPoseRelOut, sizeof(quat) * (mp->num_joints + 1));
+         g_CrPoseRelSaved = TRUE;
+      }
+      return;
+   }
+   CrPoseApply(obj, mp, pCreature->GetCreatureDesc()->pJointParents);
+}
+
+void CreaturePoseUndo(ObjID obj)
+{
+   if (!g_CrPoseRelSaved || obj != g_CrPoseHookObj)
+      return;
+   cCreature *pCreature = CreatureFromObj(obj);
+   const multiped *mp = pCreature ? pCreature->GetMultiped() : NULL;
+   if (mp && mp->rel_orients && mp->num_joints < 64)
+      memcpy(mp->rel_orients, g_CrPoseRelWas, sizeof(quat) * (mp->num_joints + 1));
+   g_CrPoseRelSaved = FALSE;
+}
+
+void CreatureSetPoseHook(ObjID obj, tCreaturePoseHook hook)
+{
+   g_CrPoseHookObj = obj;
+   g_CrPoseHook = hook;
+   g_CrPoseRelSaved = FALSE;
+   g_CrPoseOutN = 0;
+}
+
+// A creature whose height whoever moves it sets, its motion's or not
+// (CreatureFreeHeight): Garrett's body double in the air, jumping
+static ObjID g_CrHeightFreeObj = OBJ_NULL;
+
+void CreatureFreeHeight(ObjID obj)
+{
+   g_CrHeightFreeObj = obj;
+}
+#endif // DARK_RT
+
 // @YO OVER HERE
 void LGAPI CrPosPropListener(sPropertyListenMsg* msg, PropListenerData data)
    // Listener for the position property.
@@ -3857,7 +3970,21 @@ void cCreature::Update(const ulong timeDelta)
    gUseHeadTracking = TRUE;
 
    // Only run a single frame for now...
+#ifdef DARK_RT
+   // (the path tracer's body double for Garrett: its pose reshaped, after its
+   // motion set its joints -- CreatureSetPoseHook)
+   const BOOL poseHooked = m_ObjID == g_CrPoseHookObj && g_CrPoseHook && m_nJoints < 64;
+   if (poseHooked && g_CrPoseRelSaved)
+   {
+      memcpy(m_sMultiped.rel_orients, g_CrPoseRelWas, sizeof(quat) * (m_nJoints + 1));
+      g_CrPoseRelSaved = FALSE;
+   }
+#endif
    moved = SubFrameUpdate(timeDelta);
+#ifdef DARK_RT
+   if (moved && poseHooked && !CrPoseIsOut(&m_sMultiped))
+      CrPoseApply(m_ObjID, &m_sMultiped, g_pCreatureDescPtr[m_CreatureType]->pJointParents);
+#endif
 
    if(moved)
    {

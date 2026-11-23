@@ -40,6 +40,10 @@
 
 #include <timings.h>
 #include <platform_services.h>
+#ifdef DARK_RT
+#include <algorithm>
+#include <render_rt.h>
+#endif
 
 #include <mprintf.h>
 
@@ -365,6 +369,22 @@ static eLoopMessageResult LGAPI _LoopFunc(void* data, eLoopMessage msg, tLoopMes
             mprintf("[%d] ",gSimTime.nTicks);
 #endif
 
+#ifdef DARK_RT
+         // The path tracer's frame rate setting (60 as authored, 100 or 120
+         // for a fast display): the frame's least length, and the least
+         // simulated step with it, or game time would run ahead of real time
+         // (the simulation never steps less than 10 ms by itself).
+         if (RenderRTActive())
+         {
+            const int cap = RenderRTFrameCap();
+            if (cap > 0)
+            {
+               nSlowFrameTime = 1000 / cap;
+               gParams.minFrameTime = std::min<tSimTime>(DEFAULT_MIN_SIM_TIME,
+                  (tSimTime)(nSlowFrameTime * SIM_TIME_SECOND / 1000));
+            }
+         }
+#endif
          if (nSlowFrameTime > 0)
          {
 //            nCurrentRealFrameTime = tm_get_millisec_unrecorded();

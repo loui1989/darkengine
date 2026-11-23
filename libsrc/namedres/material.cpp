@@ -11,6 +11,7 @@
 #include <mprintf.h>
 #include <render_backend.h>
 
+#include <cstdio>
 #include <memory>
 #include <unordered_map>
 #include <cmath>
@@ -78,6 +79,53 @@ void ApplyFlags(const sTextureMaterial &s, grs_bitmap *bitmap)
       bitmap->flags &= ~BMF_TLUC;
    }
 }
+#ifdef DARK_RT
+// Every loaded image's name from its resource root ("fam/mech/dal01"), for the
+// path tracer: its material maps are found and made by it (rt/rt_materials.h).
+auto &sources()
+{
+   static auto *map = new std::unordered_map<const grs_bitmap *, std::string>;
+   return *map;
+}
+std::string SourceName(const char *canonPath, const char *name)
+{
+   std::string full = canonPath ? canonPath : "";
+   if (!full.empty() && full.back() != '/' && full.back() != '\\')
+      full += '/';
+   full += name ? name : "";
+   for (char &c : full)
+      c = c == '\\' ? '/' : (char)tolower((unsigned char)c);
+   // fam.crf/mech/x -> fam/mech/x
+   for (size_t at; (at = full.find(".crf/")) != std::string::npos; )
+      full.erase(at, 4);
+   static const char *const roots[] = {"/fam/", "/obj/", "/mesh/", "/bitmap/", "/intrface/",
+                                       "/book/", "/books/", "/pal/"};
+   size_t best = std::string::npos;
+   for (const char *r : roots)
+      for (size_t at = full.find(r); at != std::string::npos; at = full.find(r, at + 1))
+         if (best == std::string::npos || at > best)
+            best = at;
+   std::string out;
+   if (best != std::string::npos)
+      out = full.substr(best + 1);
+   else if (full.compare(0, 4, "fam/") == 0 || full.compare(0, 4, "obj/") == 0 ||
+            full.compare(0, 5, "mesh/") == 0)
+      out = full;
+   else
+   {
+      // the last two parts
+      const size_t last = full.rfind('/');
+      const size_t prev = last == std::string::npos || last == 0 ? std::string::npos
+                                                                 : full.rfind('/', last - 1);
+      out = prev == std::string::npos ? full : full.substr(prev + 1);
+   }
+   const size_t dot = out.rfind('.');
+   if (dot != std::string::npos && out.find('/', dot) == std::string::npos)
+      out.erase(dot);
+   return out;
+}
+#endif
+
 bool Read(IRes *resource, std::string &text)
 {
    if (!resource)
@@ -101,6 +149,15 @@ bool Read(IRes *resource, std::string &text)
 void ResMaterialLoad(IResManHelper *helper, IRes *image, grs_bitmap *bitmap)
 {
    cAutoResThreadLock lock;
+#ifdef DARK_RT
+   {
+      char *canon = nullptr;
+      image->GetCanonPath(&canon);
+      sources()[bitmap] = SourceName(canon, image->GetName());
+      if (canon)
+         Free(canon);
+   }
+#endif
    auto *manager = static_cast<cResMan *>(helper);
    const std::string name = std::string(image->GetName()) + ".mtl";
    std::string initial;
@@ -155,6 +212,13 @@ extern "C" const sTextureMaterial *ResMaterialGet(const grs_bitmap *bitmap)
 extern "C" void ResMaterialClone(const grs_bitmap *source, grs_bitmap *destination)
 {
    cAutoResThreadLock lock;
+#ifdef DARK_RT
+   {
+      const auto name = sources().find(source);
+      if (name != sources().end())
+         sources()[destination] = name->second;
+   }
+#endif
    auto found = entries().find(source);
    if (found != entries().end())
    {
@@ -171,6 +235,9 @@ extern "C" void ResMaterialClone(const grs_bitmap *source, grs_bitmap *destinati
 extern "C" void ResMaterialForget(const grs_bitmap *bitmap)
 {
    cAutoResThreadLock lock;
+#ifdef DARK_RT
+   sources().erase(bitmap);
+#endif
    terrain().erase(bitmap);
    entries().erase(bitmap);
 }
@@ -280,3 +347,32 @@ extern "C" void ResMaterialReset()
    terrain().clear();
    detached.clear();
 }
+
+#ifdef DARK_RT
+extern "C" int ResImageSourceInfo(const grs_bitmap *bitmap, char *name, int nameSize,
+                                  float *illumination, char *illuminationMap, int mapSize)
+{
+   cAutoResThreadLock lock;
+   if (name && nameSize > 0)
+      name[0] = 0;
+   if (illumination)
+      *illumination = 0;
+   if (illuminationMap && mapSize > 0)
+      illuminationMap[0] = 0;
+   const auto found = sources().find(bitmap);
+   if (found == sources().end())
+      return 0;
+   if (name && nameSize > 0)
+      snprintf(name, nameSize, "%s", found->second.c_str());
+   const auto entry = entries().find(bitmap);
+   if (entry != entries().end() && entry->second->material.settings.illumination > 0 &&
+       !entry->second->material.illumination.empty())
+   {
+      if (illumination)
+         *illumination = entry->second->material.settings.illumination;
+      if (illuminationMap && mapSize > 0)
+         snprintf(illuminationMap, mapSize, "%s", entry->second->material.illumination.c_str());
+   }
+   return 1;
+}
+#endif

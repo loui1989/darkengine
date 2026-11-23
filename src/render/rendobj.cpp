@@ -6,6 +6,9 @@
 // $Header: r:/t2repos/thief2/src/render/rendobj.cpp,v 1.5 2000/02/28 16:50:59 MAT Exp $
 
 // Render an object
+#ifdef DARK_RT
+#include <vector>   // (first: the headers below declare C linkage)
+#endif
 #include <objarray.h>
 
 #include <math.h>
@@ -122,6 +125,23 @@ extern void set_mm_sort(bool);
 //#define CTIMER_ON
 #include <ctimer.h>
 
+#ifdef DARK_RT
+#include <render_rt.h>
+#include <plycbllm.h>
+EXTERN void lgd3d_render_flush(void);
+EXTERN int r3d_rt_noclip, r3d_rt_backface;
+EXTERN ObjID GetWeaponObjID(ObjID owner);   // weapon.h
+// The player's own arm, weapon and nocked arrow: drawn in front of the
+// camera, they move with it, and as shadow casters they threw the camera's
+// own shadow over whatever it approached -- the shadows that "filled in"
+// under a lamp as you walked up to it.
+static BOOL rt_first_person_object(ObjID obj)
+{
+   if (obj == PlayerArm() || obj == PlayerArrow())
+      return obj != OBJ_NULL;
+   return PlayerObjectExists() && obj == GetWeaponObjID(PlayerObject());
+}
+#endif
 #include <dbmem.h>
 
 
@@ -2416,6 +2436,14 @@ BOOL rendobj_core_render_object(ObjID obj, int fragment, int idx, uchar *clut,
    if (g_lgd3d)
       r3_use_lgd3d();
 
+#ifdef DARK_RT
+   // a still model the ray tracer already has as it is (RenderRTObjectReuse):
+   // not drawn again (not the one in reach, lit up; not his arm or weapon)
+   if (g_lgd3d && RenderRTCaptureDraws() && fragment == OBJ_NO_SPLIT && obj != highlit_obj &&
+       !rt_first_person_object(obj) && RenderRTObjectReuse((uint32_t)obj))
+      return TRUE;
+#endif
+
    setup_object_lighting(obj, 0, 0);
 
    ptmf->setup(obj);
@@ -2426,7 +2454,46 @@ BOOL rendobj_core_render_object(ObjID obj, int fragment, int idx, uchar *clut,
       rendobjScaleVec = &rendobjUnitScale;
 
    rendobj_start_translucency(obj);
+#ifdef DARK_RT
+   // Tell the ray tracer which object the following triangles belong to, so
+   // a static object can keep casting shadows while it is out of view.
+   // lgd3d batches, so pending triangles are flushed to the right owner.
+   // A model drawn in one piece is captured whole, unclipped by the view:
+   // what is off screen still shadows what is on it.
+   const BOOL rt_object = g_lgd3d && RenderRTCaptureDraws();
+   int rt_type = rt_object ? rendobj_type(obj) : OM_TYPE_DEFAULT;
+   // Every model is captured unclipped: a model the view draws in pieces,
+   // one per cell, clipped to each cell's part of the screen, came in
+   // nothing at all whenever the clipping cut it (a water stream partly
+   // above the screen stopped, frozen on its last capture). Unclipped, the
+   // first piece is all of it and the rest add nothing.
+   const BOOL rt_whole = rt_object;
+   int rt_suppressed = 0;
+   if (rt_object)
+   {
+      // an object is always captured, whatever pass draws it
+      rt_suppressed = RenderRTSuppressCapture(0);
+      lgd3d_render_flush();
+      const BOOL rt_own = rt_first_person_object(obj);
+      RenderRTObjectBegin(obj, (rt_whole ? kRenderRTObjectWhole : 0) |
+                               ((rt_type != OM_TYPE_MD && rt_type != OM_TYPE_MESH) || rt_own
+                                   ? kRenderRTObjectNoShadow : 0) |
+                               (rt_own ? kRenderRTObjectFirstPerson : 0));
+      if (rt_whole)
+         r3d_rt_noclip = 1;
+   }
+#endif
    rval = rendfunc(idx, obj, fragment, 0, clut);
+#ifdef DARK_RT
+   if (rt_object)
+   {
+      lgd3d_render_flush();
+      r3d_rt_noclip = 0;
+      r3d_rt_backface = 0;
+      RenderRTObjectEnd();
+      RenderRTSuppressCapture(rt_suppressed);
+   }
+#endif
    rendobj_stop_translucency(obj);
 
    ptmf->finish(obj);
@@ -2565,6 +2632,19 @@ void rendobj_render_object(ObjID obj, uchar *clut, ulong fragment)
 #endif
       goto done;
    }
+
+#ifdef DARK_RT
+   // An object reaching into several cells is drawn once per cell, clipped to
+   // each. The ray tracer has no use for that (it rasterizes nothing) and a
+   // clipped capture shadows only with the part in view, so it takes the
+   // object whole, the first time it is met this frame.
+   if (g_lgd3d && RenderRTCaptureDraws())
+   {
+      if (obj_dealt[obj] && ObjPosGet(obj))
+         rendobj_core_render_object(obj, OBJ_NO_SPLIT, idx, clut, ptmf->render, ptmf);
+      goto done;
+   }
+#endif
 
 #ifdef HACK_CACHE
 #ifndef SHIP
@@ -3022,4 +3102,321 @@ void rendobj_exit(void)
 
 
 }  // extern "C"
+
+
+#ifdef DARK_RT
+#include <objsys.h>
+#include <objquery.h>
+#include <traitman.h>
+#include <contain.h>
+// For the ray tracer's object cache (render_rt.h): is the object still in
+// the world where it was?  Destroyed, contained (picked up, in a chest) and
+// world-less objects answer no.
+extern "C" int RenderRTGameObjectPose(uint32_t obj, float pose[6])
+{
+   const ObjID id = (ObjID)obj;
+   if (id <= 0 || !ObjectExists(id) || !ObjHasRefs(id))
+      return 0;
+   Position *pos = ObjPosGet(id);
+   if (!pos)
+      return 0;
+   pose[0] = pos->loc.vec.x;
+   pose[1] = pos->loc.vec.y;
+   pose[2] = pos->loc.vec.z;
+   pose[3] = pos->fac.tx;
+   pose[4] = pos->fac.ty;
+   pose[5] = pos->fac.tz;
+   return 1;
+}
+
+// Models near the camera that the view did not draw, for the ray tracer:
+// once each while they stay where they are (it keeps them), every frame
+// while they move. At most a few per frame, so walking into a crowded room
+// does not stall a frame.
+// Garrett's body double's weapon, hidden while he holds none (or another
+// than its model carries): a thief model's sword or bow is part of a hand's
+// piece of it, reaching out from the wrist past where any hand does (the
+// hands of Thief's thief models end within 0.65 ft of the wrist joint; a
+// sword's guard begins at 0.69, a bow at 1.0). The polygons with a corner
+// that far out from a wrist are not drawn.
+static const mms_model *g_BodyFilterModel = NULL;
+static std::vector<bool> g_BodyWeaponVerts;
+static std::vector<mms_pgon> g_BodyPgons;
+static mmf_block_render_cback g_BodyPrevBlock = NULL;
+
+static void body_weapon_verts(const mms_model *m)
+{
+   if (m == g_BodyFilterModel)
+      return;
+   g_BodyFilterModel = m;
+   g_BodyWeaponVerts.assign(m->verts, false);
+   const mms_segment *segs = mm_segment_list(m);
+   const mms_mapping *maps = mm_mapping_list(m);
+   const mms_smatseg *smatsegs = mm_smatseg_list(m);
+   const mxs_vector *pos = mm_vert_vec_list(m);
+   int hidden = 0;
+   for (int s = 0; s < m->segs; ++s)
+   {
+      const mms_segment &seg = segs[s];
+      // (a humanoid's wrists: kCJ_LWrist, kCJ_RWrist as its joints 14, 15)
+      if ((seg.flags & MMSEG_FLAG_STRETCHY) || (seg.joint_id != 14 && seg.joint_id != 15))
+         continue;
+      for (int k = 0; k < seg.smatsegs; ++k)
+      {
+         const mms_data_chunk &d = smatsegs[maps[seg.map_start + k]].data;
+         for (int v = d.vert_start; v < d.vert_start + d.verts && v < m->verts; ++v)
+            if (mx_mag2_vec((mxs_vector *)&pos[v]) > 0.65f * 0.65f)
+               g_BodyWeaponVerts[v] = true, ++hidden;
+      }
+   }
+   mprintf("Garrett's shadow: %d of the body double's %d corners are its weapon's\n", hidden, m->verts);
+}
+
+static void body_pgon_block(mms_pgon *pgons, int num)
+{
+   g_BodyPgons.clear();
+   for (int i = 0; i < num; ++i)
+   {
+      const mms_pgon &p = pgons[i];
+      bool weapon = false;
+      for (int k = 0; k < 3 && !weapon; ++k)
+         weapon = p.v[k] < g_BodyWeaponVerts.size() && g_BodyWeaponVerts[p.v[k]];
+      if (!weapon)
+         g_BodyPgons.push_back(p);
+   }
+   if (!g_BodyPgons.empty())
+      g_BodyPrevBlock(g_BodyPgons.data(), (int)g_BodyPgons.size());
+}
+
+extern "C" void RenderRTGameDrawExtraObjects(void)
+{
+   const float kRadius = 130.0f;  // feet, ~40 m
+   int budget = 24;
+   ObjID player;
+   if (!g_lgd3d || !RenderRTCaptureDraws())
+      return;
+   player = PlayerObjectExists() ? PlayerObject() : OBJ_NULL;
+   // The objects round the camera that could be drawn here, found again every
+   // 16 frames or when the camera has gone 15 ft (a few feet more round than
+   // drawn): going through every object of the mission each frame -- 8000 of
+   // them in Reflections in Red -- for the few near.
+   static std::vector<ObjID> s_near;
+   static unsigned s_calls = 0;
+   static mxs_vector s_nearAt;
+   static int s_nearMax = -1;
+   const float kNear = kRadius + 25.0f;
+   if (s_calls++ % 16 == 0 || s_nearMax != gMaxObjID ||
+       mx_dist2_vec(&portal_camera_loc, &s_nearAt) > 15.0f * 15.0f)
+   {
+      s_near.clear();
+      s_nearAt = portal_camera_loc;
+      s_nearMax = gMaxObjID;
+      for (ObjID obj = 1; obj < gMaxObjID; ++obj)
+      {
+         if (!ObjectExists(obj) || !ObjHasRefs(obj))
+            continue;
+         Position *pos = ObjPosGet(obj);
+         if (!pos || mx_dist2_vec(&pos->loc.vec, &portal_camera_loc) > kNear * kNear)
+            continue;
+         const int type = rendobj_type(obj);
+         if (type == OM_TYPE_MD || type == OM_TYPE_MESH)
+            s_near.push_back(obj);
+      }
+   }
+   RenderRTPrepMark(5);
+   for (ObjID obj : s_near)
+   {
+      if (budget <= 0)
+         break;
+      if (obj == player || !ObjectExists(obj) || !ObjHasRefs(obj))
+         continue;
+      Position *pos = ObjPosGet(obj);
+      if (!pos || mx_dist2_vec(&pos->loc.vec, &portal_camera_loc) > kRadius * kRadius)
+         continue;
+      const int type = rendobj_type(obj);
+      if (type != OM_TYPE_MD && type != OM_TYPE_MESH)
+         continue;
+      if (ObjRenderType(obj) == kRenderNotAtAll)
+         continue;
+      if (!RenderRTObjectWanted((uint32_t)obj))
+         continue;
+      int idx;
+      model_funcs *ptmf = rendobj_get_model_funcs(obj, &idx);
+      if (!ptmf || !ptmf->render)
+         continue;
+      RenderRTPrepMark(5);
+      rendobj_core_render_object(obj, OBJ_NO_SPLIT, idx, NULL, ptmf->render, ptmf);
+      RenderRTPrepMark(4);
+      --budget;
+   }
+   RenderRTPrepMark(5);
+   // Garrett himself, every frame: his body double (plycbllm.cpp), a thief
+   // of the game's walking as he walks, for his shadow and his reflection.
+   // The ray tracer keeps it from the camera.
+   const ObjID body = PlayerBodyDouble();
+   if (body != OBJ_NULL && RenderRTPlayerBodyWanted((uint32_t)body))
+   {
+      int idx;
+      model_funcs *ptmf = rendobj_get_model_funcs(body, &idx);
+      if (ptmf && ptmf->render)
+      {
+         const mms_model *m = rendobj_type(body) == OM_TYPE_MESH ? (const mms_model *)objmodelGetModel(idx) : NULL;
+         const BOOL filter = m && !PlayerBodyShowsWeapon();
+         if (filter)
+         {
+            body_weapon_verts(m);
+            g_BodyPrevBlock = mm_set_block_render_cback(body_pgon_block);
+         }
+         rendobj_core_render_object(body, OBJ_NO_SPLIT, idx, NULL, ptmf->render, ptmf);
+         if (filter)
+            mm_set_block_render_cback(g_BodyPrevBlock);
+      }
+      // and his blackjack, in its hand
+      const ObjID item = PlayerBodyHeldItem();
+      if (item != OBJ_NULL && RenderRTPlayerBodyItemWanted((uint32_t)item))
+      {
+         int iidx;
+         model_funcs *pimf = rendobj_get_model_funcs(item, &iidx);
+         if (pimf && pimf->render)
+            rendobj_core_render_object(item, OBJ_NO_SPLIT, iidx, NULL, pimf->render, pimf);
+      }
+   }
+   RenderRTPrepMark(6);
+}
+
+// Every object within radius (feet) of a point, as the game sees it, for the
+// ray tracer's inspector: what it is, where, whether the view drew it last
+// frame, its model and whether it is a creature.
+EXTERN BOOL ObjGetModelName(ObjID obj, char *name);
+EXTERN BOOL CreatureExists(const ObjID objID);
+extern "C" void RenderRTGameDescribeNearby(const float at[3], float radius,
+                                           void (*line)(const char *text, void *ctx), void *ctx)
+{
+   mxs_vector p = { at[0], at[1], at[2] };
+   for (ObjID obj = 1; obj < gMaxObjID; ++obj)
+   {
+      if (!ObjectExists(obj))
+         continue;
+      Position *pos = ObjPosGet(obj);
+      if (!pos || mx_dist2_vec(&pos->loc.vec, &p) > radius * radius)
+         continue;
+      char model[64] = "";
+      ObjGetModelName(obj, model);
+      int idx = -1;
+      const BOOL hasModel = ObjGetModelNumber(obj, &idx);
+      const char *name = ObjEditName(obj);
+      char text[320];
+      snprintf(text, sizeof(text),
+               "  object %d \"%s\": at (%.2f %.2f %.2f) m, %.1f m away, model \"%s\"%s, type %d, render %d, "
+               "%s%s%s\n",
+               obj, name ? name : "?", pos->loc.vec.x * 0.3048f, pos->loc.vec.y * 0.3048f,
+               pos->loc.vec.z * 0.3048f, sqrtf(mx_dist2_vec(&pos->loc.vec, &p)) * 0.3048f, model,
+               hasModel ? "" : " (not loaded)", hasModel ? rendobj_type(obj) : -1, (int)ObjRenderType(obj),
+               rendobj_object_visible(obj) ? "drawn by the view" : "not drawn by the view",
+               CreatureExists(obj) ? ", a creature" : "",
+               ObjHasRefs(obj) ? "" : ", no place in the world");
+      line(text, ctx);
+      // a creature (a rope): where its joints reach, and the cells it is
+      // listed in -- the view draws an object only from a cell it sees
+      if (CreatureExists(obj))
+      {
+         mxs_vector mn, mx;
+         if (ObjGetWorldBBox(obj, &mn, &mx))
+         {
+            char cells[200] = "";
+            int n = 0, at = 0;
+            const ObjRefID first = OBJ_FIRST_REF(obj, mCellRefSys);
+            ObjRefID id = first;
+            while (id != 0 && n < 64)
+            {
+               ObjRef *ref = OBJREFID_TO_PTR(id);
+               if (!ref)
+                  break;
+               int cell;
+               memcpy(&cell, ref->bin, sizeof(cell));
+               if (at < (int)sizeof(cells) - 12)
+                  at += snprintf(cells + at, sizeof(cells) - at, " %d", cell);
+               ++n;
+               id = ref->next_of_obj;
+               if (id == first)
+                  break;
+            }
+            char text3[400];
+            snprintf(text3, sizeof(text3),
+                     "      its joints reach (%.2f %.2f %.2f) to (%.2f %.2f %.2f) m; listed in %d cell%s:%s\n",
+                     mn.x * 0.3048f, mn.y * 0.3048f, mn.z * 0.3048f, mx.x * 0.3048f, mx.y * 0.3048f,
+                     mx.z * 0.3048f, n, n == 1 ? "" : "s", cells);
+            line(text3, ctx);
+         }
+      }
+   }
+}
+
+extern "C" int RenderRTGameObjectIsCreature(uint32_t obj)
+{
+   return CreatureExists((ObjID)obj) ? 1 : 0;
+}
+
+extern "C" void RenderRTGameObjectName(uint32_t obj, char *buf, int size)
+{
+   const char *name = ObjEditName((ObjID)obj);
+   snprintf(buf, size, "%s", name ? name : "?");
+}
+
+// For the path tracer's effects (rtgl1.cpp, fx_scan): an object's archetype and
+// model names; where it is (1 in the world, 2 held -- in a container, as the
+// player's inventory -- 0 gone); and every object, for the scan.
+extern "C" void RenderRTGameObjectKind(uint32_t obj, char *arch, int an, char *model, int mn)
+{
+   arch[0] = model[0] = '\0';
+   AutoAppIPtr(TraitManager);
+   AutoAppIPtr_(ObjectSystem, pObjSys);
+   const ObjID a = pTraitManager->GetArchetype((ObjID)obj);
+   const char *n = a ? pObjSys->GetName(a) : NULL;
+   snprintf(arch, an, "%s", n ? n : "");
+   char m[64] = "";
+   if (ObjGetModelName((ObjID)obj, m))
+      snprintf(model, mn, "%s", m);
+}
+
+// an object's kind of model (OM_TYPE_: 6 a picture, a bitmap), -1 none loaded
+extern "C" int RenderRTGameObjectModelType(uint32_t obj)
+{
+   int idx = -1;
+   if (!ObjGetModelNumber((ObjID)obj, &idx))
+      return -1;
+   return rendobj_type((ObjID)obj);
+}
+
+extern "C" int RenderRTGameObjectArchetype(uint32_t obj)
+{
+   AutoAppIPtr(TraitManager);
+   return (int)pTraitManager->GetArchetype((ObjID)obj);
+}
+
+extern "C" int RenderRTGameObjectWhere(uint32_t obj, float pos[3])
+{
+   if (!OBJ_IS_CONCRETE((ObjID)obj) || !ObjExists((ObjID)obj))
+      return 0;
+   AutoAppIPtr(ContainSys);
+   if (pContainSys->GetContainer((ObjID)obj) != OBJ_NULL)
+      return 2;
+   const mxs_vector *v = ObjPosGetLocVector((ObjID)obj);
+   if (!v)
+      return 2;
+   pos[0] = v->x;
+   pos[1] = v->y;
+   pos[2] = v->z;
+   return 1;
+}
+
+extern "C" void RenderRTGameForEachObject(void (*fn)(uint32_t obj, void *user), void *user)
+{
+   AutoAppIPtr_(ObjectSystem, pObjSys);
+   IObjectQuery *q = pObjSys->Iter(kObjectConcrete);
+   for (; !q->Done(); q->Next())
+      fn((uint32_t)q->Object(), user);
+   q->Release();
+}
+#endif
 

@@ -18,6 +18,21 @@
 #include <render_backend.h>
 #include <material.h>
 static int texture_level;
+#ifdef DARK_RT
+#include <render_rt.h>
+// r3d's camera-to-world transform (libsrc/r3d/block.c)
+extern float r3d_rt_c2w[12];
+extern int r3d_rt_c2w_valid;
+extern int r3d_rt_project_space;
+extern int r3d_rt_backface;
+// RenderRTDrawWorld: the triangles are shadow-only (see r3d_rt_backface)
+extern int g_RenderRTShadowOnly;
+// set while lgd3d draws a glowing sprite (lgd3d_hack_light)
+extern int g_RenderRTEmissiveSprite;
+// for the ray tracer's log: this model's draws, and its triangles dropped
+// for want of a world position
+extern int g_RenderRTCaptureCalls, g_RenderRTCaptureDropped;
+#endif
 
 #ifdef MONO_SPEW
 #define put_mono(c) \
@@ -44,7 +59,32 @@ typedef struct sLgd3dVertex {
    float sx, sy, sz, rhw;
    uint32 color, specular;
    float tu, tv;
+#ifdef DARK_RT
+   float wx, wy, wz;   // world position, for the ray tracer
+   int wvalid;
+   // the material's own colour before lgd3d's lighting, for untextured
+   // polygons (0: use color). The path tracer lights them itself.
+   uint32 rtcolor;
+   int wback;          // a culled (back) face kept for shadows
+#endif
 } sLgd3dVertex;
+
+#ifdef DARK_RT
+#define rt_set_world(_d, _p) \
+do { \
+   const float *_m = r3d_rt_c2w; \
+   float _x = (float)(_p)->x, _y = (float)(_p)->y, _z = (float)(_p)->z; \
+   (_d)->wx = _m[0]*_x + _m[1]*_y + _m[2]*_z + _m[3]; \
+   (_d)->wy = _m[4]*_x + _m[5]*_y + _m[6]*_z + _m[7]; \
+   (_d)->wz = _m[8]*_x + _m[9]*_y + _m[10]*_z + _m[11]; \
+   (_d)->wvalid = r3d_rt_c2w_valid && g_RenderRTCaptureVertices; \
+   (_d)->wback = r3d_rt_backface; \
+} while (0)
+#define rt_clear_world(_d) ((_d)->wvalid = 0)
+#else
+#define rt_set_world(_d, _p) ((void)0)
+#define rt_clear_world(_d) ((void)0)
+#endif
 
 static uint32 PackColor(int r, int g, int b, int a)
 {
@@ -190,6 +230,7 @@ do { \
       else if (__dest->sz < 0.0f) \
          __dest->sz = 0.0f;  }\
    __dest->rhw = (float)(w);  \
+   rt_clear_world(__dest); \
 } while (0)
 
 #define setxyz(dest, src) \
@@ -209,6 +250,7 @@ do { \
    _dest->sx = fix_float(_sx)+x_offset; \
    _dest->sy = fix_float(_sy)+y_offset; \
    setz(_dest, _src->p.z, _src->grp.w); \
+   rt_set_world(_dest, &_src->p); \
 } while (0)
 
 void lgd3d_set_offsets(int x, int y)
@@ -638,6 +680,81 @@ static void ModernConvertVertex(sRenderBackendVertex *d, const sLgd3dVertex *s)
    d->u0=s->tu; d->v0=s->tv; d->u1=d->v1=0.0f;
 }
 
+#ifdef DARK_RT
+// While the main view is drawn the ray tracer takes its triangles with world
+// positions. Triangles built while capture was suppressed (world surfaces,
+// which come from the world representation), lines, points and 2D effects
+// have no place in it and are dropped. Returns TRUE if the draw was consumed.
+static BOOL ModernCapture(int primitive, int count, const sRenderBackendVertex *dst,
+                          const sLgd3dVertex *src, const ushort *indices, BOOL fan)
+{
+   int i, t, kept = 0, pass;
+   float *xyz;
+   sRenderBackendVertex *out;
+   if (!RenderRTCaptureDraws())
+      return FALSE;
+   ++g_RenderRTCaptureCalls;
+   if (primitive != kRenderBackendTriangles || count < 3)
+      return TRUE;
+   xyz = (float *)temp_malloc(count * 3 * sizeof(float));
+   out = (sRenderBackendVertex *)temp_malloc(count * sizeof(*out));
+   // pass 0: faces as the game draws them; pass 1: back faces, shadow-only
+   for (pass = 0; pass < 2; ++pass) {
+   kept = 0;
+   for (t = 0; t + 2 < count; t += 3) {
+      const sLgd3dVertex *v[3];
+      for (i = 0; i < 3; ++i) {
+         int n = t + i, k;
+         if (indices)
+            k = indices[n];
+         else if (fan)
+            k = (n % 3 == 0) ? 0 : (n / 3) + (n % 3);
+         else
+            k = n;
+         v[i] = &src[k];
+      }
+      if (!v[0]->wvalid || !v[1]->wvalid || !v[2]->wvalid) {
+         if (pass == 0)
+            ++g_RenderRTCaptureDropped;
+         continue;
+      }
+      if ((v[0]->wback != 0) != (pass == 1))
+         continue;
+      for (i = 0; i < 3; ++i) {
+         xyz[kept*3] = v[i]->wx; xyz[kept*3+1] = v[i]->wy; xyz[kept*3+2] = v[i]->wz;
+         out[kept] = dst[t + i];
+         if (v[i]->rtcolor) {
+            out[kept].r = ((v[i]->rtcolor >> 16) & 255) / 255.0f;
+            out[kept].g = ((v[i]->rtcolor >> 8) & 255) / 255.0f;
+            out[kept].b = (v[i]->rtcolor & 255) / 255.0f;
+         }
+         ++kept;
+      }
+   }
+   if (kept) {
+      // (the texture's material: its UVs as ModernMaterialDraw lays them)
+      grs_bitmap *bitmap = tex_id >= 0 && tex_id < LGD3D_MAX_TEXTURES ? g_legacyBitmaps[tex_id] : NULL;
+      float su = 1.0f, sv = 1.0f;
+      if (bitmap && ResMaterialGet(bitmap))
+         ResMaterialUvScale(bitmap, &su, &sv);
+      if (su != 1.0f || sv != 1.0f)
+         for (i = 0; i < kept; ++i) {
+            out[i].u0 *= su;
+            out[i].v0 *= sv;
+         }
+      g_RenderRTShadowOnly = pass;
+      RenderRTDrawWorld(primitive, out, xyz, kept);
+      g_RenderRTShadowOnly = 0;
+   }
+   }
+   temp_free(out);
+   temp_free(xyz);
+   return TRUE;
+}
+#else
+#define ModernCapture(p, c, d, s, i, f) FALSE
+#endif
+
 static void ModernMaterialDraw(int primitive, sRenderBackendVertex *vertices, int count, BOOL second)
 {
    grs_bitmap *bitmap = tex_id >= 0 && tex_id < LGD3D_MAX_TEXTURES ? g_legacyBitmaps[tex_id] : NULL;
@@ -702,7 +819,8 @@ static void ModernSubmitList(int primitive, int n, const sLgd3dVertex *src)
    int i;
    sRenderBackendVertex *dst=(sRenderBackendVertex *)temp_malloc(n*sizeof(*dst));
    for(i=0;i<n;++i) ModernConvertVertex(&dst[i],&src[i]);
-   ModernMaterialDraw(primitive, dst, n, FALSE);
+   if (!ModernCapture(primitive,n,dst,src,NULL,FALSE))
+      ModernMaterialDraw(primitive, dst, n, FALSE);
    temp_free(dst);
 }
 
@@ -717,7 +835,8 @@ static void ModernSubmitFan(int n, const sLgd3dVertex *src)
       ModernConvertVertex(&dst[j++],&src[i-1]);
       ModernConvertVertex(&dst[j++],&src[i]);
    }
-   ModernMaterialDraw(kRenderBackendTriangles, dst, count, FALSE);
+   if (!ModernCapture(kRenderBackendTriangles,count,dst,src,NULL,TRUE))
+      ModernMaterialDraw(kRenderBackendTriangles, dst, count, FALSE);
    temp_free(dst);
 }
 
@@ -726,7 +845,8 @@ static void ModernSubmitIndexed(int count,const ushort *indices,const sLgd3dVert
    int i;
    sRenderBackendVertex *dst=(sRenderBackendVertex *)temp_malloc(count*sizeof(*dst));
    for(i=0;i<count;++i)ModernConvertVertex(&dst[i],&src[indices[i]]);
-   ModernMaterialDraw(kRenderBackendTriangles, dst, count, FALSE);
+   if (!ModernCapture(kRenderBackendTriangles,count,dst,src,indices,FALSE))
+      ModernMaterialDraw(kRenderBackendTriangles, dst, count, FALSE);
    temp_free(dst);
 }
 
@@ -796,8 +916,13 @@ static sLgd3dVertex *PolyMalloc(int n)
    sLgd3dVertex *retval;
    int i;
 
-   if (lgd3d_punt_buffer)
-      return (sLgd3dVertex *)temp_malloc(n*sizeof(sLgd3dVertex));
+   if (lgd3d_punt_buffer) {
+      retval = (sLgd3dVertex *)temp_malloc(n*sizeof(sLgd3dVertex));
+#ifdef DARK_RT
+      for (i = 0; i < n; ++i) retval[i].wvalid = 0, retval[i].rtcolor = 0, retval[i].wback = 0;
+#endif
+      return retval;
+   }
 
    prim_setup();
 
@@ -824,6 +949,9 @@ static sLgd3dVertex *PolyMalloc(int n)
    num_polys++;
    num_poly_verts += n;
    primitives_pending = TRUE;
+#ifdef DARK_RT
+   for (i = 0; i < n; ++i) retval[i].wvalid = 0, retval[i].rtcolor = 0, retval[i].wback = 0;
+#endif
 
    return retval;
 }
@@ -1043,6 +1171,44 @@ static void do_quad_light(r3s_point *p, float r, grs_bitmap *bm)
    sLgd3dVertex *vl;
    uint32 c;
 
+#ifdef DARK_RT
+   // A camera-facing sprite (a light's glow, a particle) for the ray tracer:
+   // the whole quad, uncropped by the screen, placed in the world from the
+   // centre point and the sprite's size on screen.
+   if (g_RenderRTCaptureVertices && r3d_rt_project_space) {
+      static const float qx[4] = {-1, 1, 1, -1}, qy[4] = {-1, -1, 1, 1};
+      int i;
+      const float k = 65536.0f * (float)p->p.z;
+      if (p->p.z <= 0.0f)
+         return;
+      c = get_color()|0xff000000;
+      gr_set_fill_type(FILL_BLEND);
+      lgd3d_set_alpha_pal(hack_light_alpha_pal);
+      lgd3d_set_texture(bm);
+      vl = PolyMalloc(4);
+      for (i = 0; i < 4; ++i) {
+         mxs_vector c3;
+         vl[i].tu = qx[i] < 0 ? 0.0f : 1.0f;
+         vl[i].tv = qy[i] < 0 ? 0.0f : 1.0f;
+         vl[i].sx = x + qx[i] * r;
+         vl[i].sy = y + qy[i] * r;
+         vl[i].color = c;
+         vl[i].specular = fog_specular;
+         setz(&vl[i], p->p.z, p->grp.w);
+         c3.x = p->p.x + qx[i] * r * k;
+         c3.y = p->p.y + qy[i] * r * k;
+         c3.z = p->p.z;
+         rt_set_world(&vl[i], &c3);
+      }
+      g_RenderRTEmissiveSprite = 1;
+      PolyFree(4, vl);
+      flush_polys();
+      g_RenderRTEmissiveSprite = 0;
+      gr_set_fill_type(FILL_NORM);
+      return;
+   }
+#endif
+
    if ((x+r < lgd3d_clip.left) || (x-r > lgd3d_clip.right) ||
        (y+r < lgd3d_clip.top) || (y-r > lgd3d_clip.bot))
       return;
@@ -1180,6 +1346,49 @@ void lgd3d_hack_light(r3s_point *p, float r)
    }
 }
 
+#ifdef DARK_RT
+// A particle with a picture (an animated torch flame in the HD mod, a
+// spark): the game draws it as a 2D square on the screen, which has no place
+// in the world, so the ray tracer never had it -- the torches burnt without
+// a flame. Placed as do_quad_light places a light's glow.
+int lgd3d_rt_billboard(r3s_point *p, float h, float v)
+{
+   static const float qx[4] = {-1, 1, 1, -1}, qy[4] = {-1, -1, 1, 1};
+   sLgd3dVertex *vl;
+   float x, y, k;
+   uint32 c;
+   int i;
+   if (!(g_RenderRTCaptureVertices && r3d_rt_project_space))
+      return 0;
+   if (p->p.z <= 0.0f)
+      return 1;
+   k = 65536.0f * (float)p->p.z;
+   x = fix_float(p->grp.sx) + x_offset;
+   y = fix_float(p->grp.sy) + y_offset;
+   c = ((uint32)lgd3d_alpha << 24) + 0xffffff;
+   vl = PolyMalloc(4);
+   for (i = 0; i < 4; ++i) {
+      mxs_vector c3;
+      vl[i].tu = qx[i] < 0 ? 0.0f : 1.0f;
+      vl[i].tv = qy[i] < 0 ? 0.0f : 1.0f;
+      vl[i].sx = x + qx[i] * h;
+      vl[i].sy = y + qy[i] * v;
+      vl[i].color = c;
+      vl[i].specular = fog_specular;
+      setz(&vl[i], p->p.z, p->grp.w);
+      c3.x = p->p.x + qx[i] * h * k;
+      c3.y = p->p.y + qy[i] * v * k;
+      c3.z = p->p.z;
+      rt_set_world(&vl[i], &c3);
+   }
+   g_RenderRTEmissiveSprite = 1;
+   PolyFree(4, vl);
+   flush_polys();
+   g_RenderRTEmissiveSprite = 0;
+   return 1;
+}
+#endif
+
 void lgd3d_hack_light_extra(r3s_point *p, float r, grs_bitmap *bm)
 {
    if (r <= 1.0) {
@@ -1229,6 +1438,9 @@ static int lgd3d_spoly(int n, r3s_point **ppl)
       i = ppl[j]->grp.i;
       if (i>1.0) i = 1.0;
       make_scolor(&vlist[j].color, c0, i);
+#ifdef DARK_RT
+      vlist[j].rtcolor = c0 | 0xff000000;
+#endif
       vlist[j].specular = fog_specular;
       setxyz(&vlist[j], ppl[j]);
    }
@@ -1257,6 +1469,9 @@ static int lgd3d_rgb_poly(int n, r3s_point **ppl)
       g = (int)(gc*g2p->h); if (g>255) g = 255;
       b = (int)(bc*g2p->d); if (b>255) b = 255;
       vlist[j].color = PackColor(r, g, b, get_vertex_alpha(g2p));
+#ifdef DARK_RT
+      vlist[j].rtcolor = c0 | 0xff000000;
+#endif
       vlist[j].specular = fog_specular;
       setxyz(&vlist[j], ppl[j]);
    }
@@ -1355,6 +1570,46 @@ int lgd3d_trifan(int n, r3s_point **ppl)
 //
 
 int (*lgd3d_draw_poly_func)(int n, r3s_phandle *pl);
+
+#ifdef DARK_RT
+// The path tracer's sky (rtgl1.cpp sky_capture): a point of the polygon being
+// drawn, unclipped, made into the backend's vertex as the current draw
+// function makes its points (colour, alpha, texture scale). FALSE: a draw
+// function it does not know (the polygon is then taken as clipped).
+int lgd3d_rt_sky_vertex(void *point, sRenderBackendVertex *out)
+{
+   r3s_point *p = (r3s_point *)point;
+   g2s_point *g2p = (g2s_point *)&p->grp;
+   sLgd3dVertex v;
+   memset(&v, 0, sizeof(v));
+   v.tu = p->grp.u;
+   v.tv = p->grp.v;
+   v.specular = fog_specular;
+   if (lgd3d_draw_poly_func == lgd3d_rgblit_trifan) {
+      int r, g, b;
+      r = (int)(255*g2p->i); if (r>255) r = 255; else if (r<0) r = 0;
+      g = (int)(255*g2p->h); if (g>255) g = 255; else if (g<0) g = 0;
+      b = (int)(255*g2p->d); if (b>255) b = 255; else if (b<0) b = 0;
+      v.color = PackColor(r, g, b, get_vertex_alpha(g2p));
+   } else if (lgd3d_draw_poly_func == lgd3d_rgb_poly) {
+      uint32 c0 = get_color();
+      int r, g, b;
+      r = (int)(((c0 >> 16) & 255)*g2p->i); if (r>255) r = 255; else if (r<0) r = 0;
+      g = (int)(((c0 >>  8) & 255)*g2p->h); if (g>255) g = 255; else if (g<0) g = 0;
+      b = (int)(((c0 >>  0) & 255)*g2p->d); if (b>255) b = 255; else if (b<0) b = 0;
+      v.color = PackColor(r, g, b, get_vertex_alpha(g2p));
+   } else if (lgd3d_draw_poly_func == lgd3d_lit_trifan) {
+      float i = p->grp.i;
+      if (i > 1.0) i = 1.0;
+      make_scolor(&v.color, (lgd3d_alpha << 24) + 0xffffff, i);
+   } else if (lgd3d_draw_poly_func == lgd3d_trifan) {
+      v.color = (lgd3d_alpha << 24) + 0xffffff;
+   } else
+      return FALSE;
+   ModernConvertVertex(out, &v);
+   return TRUE;
+}
+#endif
 
 void lgd3d_lit_tmap_setup(grs_bitmap *bm)
 {

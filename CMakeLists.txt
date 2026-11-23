@@ -31,6 +31,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Tracy.cmake")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/EngineConfig.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RayTracing.cmake")
 
 add_subdirectory(libsrc)
 add_subdirectory(src)

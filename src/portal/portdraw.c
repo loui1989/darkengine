@@ -74,6 +74,9 @@ float dot_clamp=0.6f;
 #include <uigame.h>
 #include <guistyle.h>
 #include <memall.h>
+#ifdef DARK_RT
+#include <render_rt.h>
+#endif
 #include <dbmem.h>   // must be last header! 
    bool draw_solid_by_MIP_level = FALSE;
    bool draw_solid_by_cell = FALSE;
@@ -1056,6 +1059,19 @@ void draw_region(int cell)
 
 #endif  // ~SHIP
 
+#ifdef DARK_RT
+   // The path tracer has the world from its own copy of it (portal.c,
+   // RenderRTWorldPolygon) and throws these draws away: the engine still
+   // set up, clipped, lit and drew every wall and floor in view -- and then
+   // its light maps in a second pass -- each frame for nothing, milliseconds
+   // of the frame in a big street. Its objects are still drawn (below).
+   if (RenderRTActive())
+   {
+      r->changed_anim_light_bitmask = 0;
+      goto skip_poly_draw;
+   }
+#endif
+
    // now draw all the polygons
 
    r3_start_block();
@@ -1227,6 +1243,19 @@ void draw_region_lgd3d(int cell)
       _polygon_cell_flags_color = (r->flags) << 8;
 
 #endif  // ~SHIP
+
+#ifdef DARK_RT
+   // The path tracer has the world from its own copy of it (portal.c,
+   // RenderRTWorldPolygon) and throws these draws away: the engine still
+   // set up, clipped, lit and drew every wall and floor in view -- and then
+   // its light maps in a second pass -- each frame for nothing, milliseconds
+   // of the frame in a big street. Its objects are still drawn (below).
+   if (RenderRTActive())
+   {
+      r->changed_anim_light_bitmask = 0;
+      goto skip_poly_draw1;
+   }
+#endif
 
    // now draw all the polygons
 
@@ -1571,6 +1600,9 @@ static void draw_many_objects(void)
    if (portal_sky_spans > 0)
       ptsky_render_stars();
 
+#ifdef DARK_RT
+   const int rt_suppressed = RenderRTSuppressCapture(0);
+#endif
 #ifdef STATS_ON
    stat_num_object_ms -= portal_get_time();
 #endif
@@ -1622,6 +1654,9 @@ static void draw_many_objects(void)
 
 #ifdef STATS_ON
    stat_num_object_ms += portal_get_time();
+#endif
+#ifdef DARK_RT
+   RenderRTSuppressCapture(rt_suppressed);
 #endif
 
    // restore g2pt_clut in case object rendering trashed it

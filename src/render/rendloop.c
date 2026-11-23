@@ -6,6 +6,9 @@
 // $Header: r:/t2repos/thief2/src/render/rendloop.c,v 1.95 2000/02/18 17:25:53 MAT Exp $
 
 #include <tracy/TracyC.h>
+#ifdef DARK_RT
+#include <render_rt.h>
+#endif
 #include <lg.h>
 #include <loopapi.h>
 #include <stdio.h>
@@ -60,6 +63,7 @@
 #include <objpos.h>
 #include <scrnman.h>
 #include <starhack.h>
+#include <star.h>
 #include <rndflash.h>
 #include <meshtex.h>
 
@@ -422,9 +426,104 @@ static void composite(float *alpha, uchar *rgb, float under_alpha, const uchar *
 extern BOOL (*pSkyRenderCallback)(void);
 
 // This is so we can draw the new sky, if specified.
+#ifdef DARK_RT
+// The enhanced sky for the path tracer: one face of a cube round the viewer
+// a frame, drawn by the sky's own renderer into a square canvas at 90
+// degrees, its polygons handed to the path tracer (RenderRTSkyFaceBegin),
+// which keeps each face's and gives them to its sky. Turned the six ways of
+// a cube: the four round, up and down.
+extern void lgd3d_render_flush(void);
+// The mission's old star sky (no enhanced sky): its stars, each a point in
+// its palette colour, as the game's star field turns them (starhack.c)
+extern int star_rate, star_axis;
+static BOOL rt_sky_star(struct sStarRenderCallbackData *d)
+{
+   r3s_point p = *d->pPoint;
+   gr_set_fcolor(d->color);
+   lgd3d_draw_point(&p);
+   return FALSE;   // (drawn: not the pixel path too)
+}
+static void rt_sky_stars(void)
+{
+   mxs_vector zero = {0, 0, 0};
+   r3_start_object_n(&zero, (mxs_ang)((tm_get_millisec() * star_rate / 16) & 0xffff), star_axis);
+   r3_start_block();
+   StarSetStarRenderCallback(rt_sky_star);
+   StarSetCheckBkgnd(FALSE);
+   StarSky();
+   StarRender();
+   StarSetStarRenderCallback(0);
+   r3_end_block();
+   r3_end_object();
+}
+extern BOOL lgd3d_punt_buffer;
+static void rt_capture_sky_face(void)
+{
+   BOOL puntWas;
+   static grs_canvas *s_canvas = NULL;
+   static int s_size = 0;
+   static const mxs_angvec kFaceAng[6] = {
+      {0, 0, 0}, {0, 0, 0x4000}, {0, 0, 0x8000}, {0, 0, 0xc000},
+      {0, 0x4000, 0}, {0, 0xc000, 0},
+   };
+   mxs_vector zero = {0, 0, 0};
+   mxs_vector vecs[4];
+   mxs_angvec ang;
+   float corners[12];
+   int i, face, size;
+
+   face = RenderRTSkyFaceWanted();
+   if (face < 0 || face > 5)
+      return;
+   size = RenderRTSkyFaceSize();
+   if (!s_canvas || s_size != size) {
+      if (s_canvas)
+         gr_free_canvas(s_canvas);
+      s_canvas = gr_alloc_canvas(grd_canvas->bm.type, size, size);
+      s_size = size;
+      if (!s_canvas)
+         return;
+   }
+   ang = kFaceAng[face];
+   gr_push_canvas(s_canvas);
+   r3_start_frame();
+   r3_set_view_angles(&zero, &ang, R3_DEFANG);
+   r3_get_view_pyr_vecs(vecs);
+   for (i = 0; i < 4; ++i) {
+      corners[i * 3 + 0] = vecs[i].x;
+      corners[i * 3 + 1] = vecs[i].y;
+      corners[i * 3 + 2] = vecs[i].z;
+   }
+   lgd3d_set_offsets(0, 0);
+   // each polygon drawn at once, not gathered with the next ones: the path
+   // tracer takes the sky's polygons whole as each is drawn (RenderRTSkyPoly),
+   // and a batch drawn later came with only the last one's points -- the rest
+   // of it lost (the sky in pieces, holes between them)
+   lgd3d_render_flush();
+   puntWas = lgd3d_punt_buffer;
+   lgd3d_punt_buffer = TRUE;
+   RenderRTSkyFaceBegin(face, corners);
+   if (SkyRendererUseEnhanced())
+      SkyRendererRender();
+   else
+      rt_sky_stars();
+   lgd3d_render_flush();
+   RenderRTSkyFaceEnd();
+   lgd3d_punt_buffer = puntWas;
+   r3_end_frame();
+   gr_pop_canvas();
+}
+#endif
+
 // return FALSE if new-style sky is NOT to be rendered, and old one should be used.
 static BOOL RenderNewSky(void)
 {
+#ifdef DARK_RT
+   // The path tracer draws its own sky and leaves the sky polygons out:
+   // the enhanced sky (clouds, stars, moon) drawn under it was only work.
+   if (RenderRTActive())
+      return FALSE;
+#endif
    if (SkyRendererUseEnhanced())
    {
       SkyRendererRender();
@@ -469,6 +568,14 @@ void cam_render_scene(Position *pos, float zoom)
 
    if ((GetSkyMode() == kSkyModeStars) && !SkyRendererUseEnhanced())
       starfield_startframe(pos, zoom);
+
+   // (the path tracer's sky, drawn by the game: outside the main view; the
+   // enhanced sky, or the old star field. The old textured sky: portal.c)
+#ifdef DARK_RT
+   if (RenderRTActive() &&
+       (SkyRendererUseEnhanced() || GetSkyMode() == kSkyModeStars))
+      rt_capture_sky_face();
+#endif
 
    rendobj_init_frame();
    pSkyRenderCallback = RenderNewSky;

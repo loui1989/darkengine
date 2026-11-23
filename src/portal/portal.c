@@ -47,6 +47,9 @@
 
 #include <wrdbrend.h> // to get access to cell texutre
 #include <memall.h>
+#ifdef DARK_RT
+#include <material.h>
+#endif
 #include <dbmem.h>   // must be last header! 
 
 #ifndef SHIP
@@ -1652,6 +1655,1052 @@ BOOL portal_true_two_pass = TRUE;
 BOOL (*pSkyRenderCallback)(void) = 0;
 BOOL bRenderNewSky = FALSE;
 
+#ifdef DARK_RT
+/* ----- Ray tracer (RTGL1) feeds ----------------------------------------- *\
+
+   The path tracer needs the whole level, not just the cells this view
+   traverses, so the world representation is handed over complete whenever
+   the mission's cells change.  Texture ids are resolved to the backend
+   texture showing for them every frame, which keeps animated textures
+   animated.  The view's own surface drawing is suppressed from capture;
+   objects drawn by the portal renderer are captured by lgd3d.
+
+\* ----------------------------------------------------------------------- */
+#include <render_rt.h>
+#include <stdlib.h>
+extern void *lgd3d_rt_texture_for_bitmap(grs_bitmap *bm);
+extern void *RenderBackendCreateTexture(int width, int height, const void *rgba, int rowBytes);
+extern void *portal_rt_water_texture(r3s_texture tex);
+extern float hw_water_tex_scale;
+extern int GetWaterBankForFlow(int idx);             // h2ocolor.cpp
+extern const void *GetWaterColorForBank(int bank);   // (an sRGBA: its rgb bytes first)
+extern void objlight_rt_submit(void);
+
+static bool portal_rt_is_sky(int texture_id)
+{
+   return texture_id == 0 ||
+      (texture_id >= BACKHACK_IDX && texture_id < TEXMEM_RESERVED_LIMIT);
+}
+
+static uint32 portal_rt_world_serial(void)
+{
+   uint32 serial = 2166136261u;
+   int i;
+   serial = (serial ^ (uint32)wr_num_cells) * 16777619u;
+   for (i = 0; i < wr_num_cells; ++i) {
+      PortalCell *cell = wr_cell[i];
+      serial = (serial ^ (uint32)(uintptr_t)cell) * 16777619u;
+      if (cell)
+         serial = (serial ^ (uint32)(cell->num_polys | (cell->num_vertices << 8))) * 16777619u;
+   }
+   return serial;
+}
+
+#define PORTAL_RT_MAX_TEXTURE_IDS 65536
+static unsigned char portal_rt_texture_seen[PORTAL_RT_MAX_TEXTURE_IDS];
+static int portal_rt_max_texture_id = -1;
+
+// The mission's old textured sky (the sky mode "textures", no enhanced sky):
+// the background cube round the camera (portbg.c) with the sky's six faces
+// (texture ids 250-255: top, bottom, then the four round), mapped as the
+// hardware renderer maps them (ptdrawhw.c), for the path tracer's sky.
+// Every frame (their textures can change), only in that mode: in the star
+// mode (portal_sky_id is the star hack's) the stars are drawn instead.
+static void portal_rt_submit_skybox(void)
+{
+#define PORTAL_RT_BG_DIST 1200.0f
+   static const signed char corner[8][3] = {
+      { 1, 1, 1}, {-1, 1, 1}, {-1,-1, 1}, { 1,-1, 1},
+      { 1, 1,-1}, {-1, 1,-1}, {-1,-1,-1}, { 1,-1,-1}
+   };
+   extern uchar background_vertex_list[24];
+   extern PortalPolygonRenderInfo background_render_list[6];
+   extern BOOL SkyRendererUseEnhanced(void);
+   int f, i;
+   // (the enhanced sky sets the textures mode too, but draws itself)
+   if (portal_sky_id == BACKHACK_IDX || SkyRendererUseEnhanced())
+      return;
+   for (f = 0; f < 6; ++f) {
+      PortalPolygonRenderInfo *ri = &background_render_list[f];
+      r3s_texture tex = portal_get_texture(ri->texture_id);
+      mxs_vector v[4], *anchor;
+      mxs_real u2, v2, t[8], umin, vmin, w, h;
+      float xyz[12], uv[8];
+      if (!tex || tex->w <= 0 || tex->h <= 0)
+         continue;
+      for (i = 0; i < 4; ++i) {
+         const signed char *k = corner[background_vertex_list[f * 4 + i]];
+         v[i].x = k[0] * PORTAL_RT_BG_DIST;
+         v[i].y = k[1] * PORTAL_RT_BG_DIST;
+         v[i].z = k[2] * PORTAL_RT_BG_DIST;
+      }
+      anchor = &v[ri->texture_anchor < 4 ? ri->texture_anchor : 0];
+      u2 = mx_mag2_vec(&ri->tex_u);
+      v2 = mx_mag2_vec(&ri->tex_v);
+      if (u2 <= 0.0f || v2 <= 0.0f)
+         continue;
+      // As ptdrawhw.c maps the sky: the face is the texture once (not in
+      // 64-texel units, as a wall), each way from half a texel in from its
+      // edge to half a texel in from the other. Offset by whole repeats to
+      // 0..1 (the cube's own offsets put some faces at -1..0).
+      umin = vmin = 1e9f;
+      for (i = 0; i < 4; ++i) {
+         mxs_vector delta;
+         mx_sub_vec(&delta, &v[i], anchor);
+         t[i*2]   = mx_dot_vec(&delta, &ri->tex_u) / u2 + ri->u_base / 4096.0f;
+         t[i*2+1] = mx_dot_vec(&delta, &ri->tex_v) / v2 + ri->v_base / 4096.0f;
+         if (t[i*2] < umin) umin = t[i*2];
+         if (t[i*2+1] < vmin) vmin = t[i*2+1];
+      }
+      umin = (mxs_real)floor(umin + 0.5f);
+      vmin = (mxs_real)floor(vmin + 0.5f);
+      w = (mxs_real)tex->w;
+      h = (mxs_real)tex->h;
+      for (i = 0; i < 4; ++i) {
+         xyz[i*3] = v[i].x; xyz[i*3+1] = v[i].y; xyz[i*3+2] = v[i].z;
+         uv[i*2]   = (t[i*2] - umin) * (w - 1.0f) / w + 0.5f / w;
+         uv[i*2+1] = (t[i*2+1] - vmin) * (h - 1.0f) / h + 0.5f / h;
+      }
+      RenderRTSkyBoxFace(f, lgd3d_rt_texture_for_bitmap(tex), xyz, uv);
+   }
+#undef PORTAL_RT_BG_DIST
+}
+
+// ---- The game's own light, for the path tracer's ambient glow ----------------
+// Each lit polygon's lightmap -- the light the game baked for it, the light the
+// light gem goes by -- packed into pages (rtgl1.cpp, RenderRTLightmapRect), and
+// where it lies there given with the polygon (RenderRTWorldPolygonLight): the
+// path tracer's ambient glow follows it, dimmer and cooler where the game has
+// it dark. Lightmaps lit by animated lights (switches, torches put out, lamps
+// that flicker) are made again when those lights change much.
+typedef struct { int cell; short poly; uchar page; ushort x, y; } PortalRtLm;
+static PortalRtLm *portal_rt_lm_anim;
+static int portal_rt_lm_anim_n, portal_rt_lm_anim_cap;
+static uchar *portal_rt_lm_used, *portal_rt_lm_changed;   // the anim lights' brightness, as made
+static int portal_rt_lm_used_n;
+static int portal_rt_lm_page, portal_rt_lm_x, portal_rt_lm_y, portal_rt_lm_shelf, portal_rt_lm_frame;
+static int portal_rt_lm_count, portal_rt_lm_texels;
+static int portal_rt_lm_hist[16];   // the lightmaps' brightness (luma 0..255, by 16), for the log
+
+static void portal_rt_lm_reset(void)
+{
+   portal_rt_lm_page = portal_rt_lm_x = portal_rt_lm_y = portal_rt_lm_shelf = 0;
+   portal_rt_lm_anim_n = portal_rt_lm_count = portal_rt_lm_texels = 0;
+   memset(portal_rt_lm_hist, 0, sizeof(portal_rt_lm_hist));
+   if (portal_anim_light_intensity && num_anim_lights > 0) {
+      portal_rt_lm_used = (uchar *)realloc(portal_rt_lm_used, num_anim_lights);
+      portal_rt_lm_changed = (uchar *)realloc(portal_rt_lm_changed, num_anim_lights);
+      if (portal_rt_lm_used && portal_rt_lm_changed) {
+         memcpy(portal_rt_lm_used, portal_anim_light_intensity, num_anim_lights);
+         portal_rt_lm_used_n = num_anim_lights;
+      } else
+         portal_rt_lm_used_n = 0;
+   } else
+      portal_rt_lm_used_n = 0;
+}
+
+// room for a w x h rectangle: its page, or -1 (all pages full)
+static int portal_rt_lm_alloc(int w, int h, int *px, int *py)
+{
+   const int P = RENDER_RT_LIGHTMAP_PAGE;
+   if (w > P || h > P)
+      return -1;
+   if (portal_rt_lm_x + w > P) {
+      portal_rt_lm_x = 0;
+      portal_rt_lm_y += portal_rt_lm_shelf;
+      portal_rt_lm_shelf = 0;
+   }
+   if (portal_rt_lm_y + h > P) {
+      ++portal_rt_lm_page;
+      portal_rt_lm_x = portal_rt_lm_y = portal_rt_lm_shelf = 0;
+   }
+   if (portal_rt_lm_page >= RENDER_RT_LIGHTMAP_PAGES)
+      return -1;
+   *px = portal_rt_lm_x;
+   *py = portal_rt_lm_y;
+   portal_rt_lm_x += w;
+   if (h > portal_rt_lm_shelf)
+      portal_rt_lm_shelf = h;
+   return portal_rt_lm_page;
+}
+
+#if defined(RGB_LIGHTING) && !defined(RGB_888)
+#define PORTAL_RT_LM_MAX 31
+#define PORTAL_RT_LM_GET(e, c) ((c) == 0 ? ((e) & 0x1f) : (c) == 1 ? (((e) >> 5) & 0x1f) : (((e) >> 10) & 0x1f))
+#elif defined(RGB_LIGHTING)
+#define PORTAL_RT_LM_MAX 255
+#define PORTAL_RT_LM_GET(e, c) ((e).A[c])
+#else
+#define PORTAL_RT_LM_MAX 255
+#define PORTAL_RT_LM_GET(e, c) (e)
+#endif
+
+// A polygon's lightmap as the game has it now (its static light and its
+// animated lights at their present brightness, as compute_lightmap adds them),
+// RGBA, (w+2) x (h+2): a border of its edge texels, so filtering at its edges
+// takes nothing from its neighbours on the page.
+static void portal_rt_lm_pixels(PortalCell *r, PortalLightMap *lt, uchar *out)
+{
+   static int acc[64 * 64 * 3];
+   const int w = lt->w, h = lt->h, W = w + 2, row = lt->pixel_row, size = lt->h * lt->pixel_row;
+   LightmapEntry *bits = lt->data;
+   int x, y, k;
+   uint mask = lt->anim_light_bitmask;
+   ushort *idx = r->anim_light_index_list;
+   for (y = 0; y < h; ++y)
+      for (x = 0; x < w; ++x)
+         for (k = 0; k < 3; ++k)
+            acc[(y * w + x) * 3 + k] = PORTAL_RT_LM_GET(bits[y * row + x], k);
+   while (mask && idx && portal_anim_light_intensity) {
+      if (mask & 1) {
+         const int inten = portal_anim_light_intensity[*idx];
+         bits += size;
+         if (inten > 0)
+            for (y = 0; y < h; ++y)
+               for (x = 0; x < w; ++x)
+                  for (k = 0; k < 3; ++k)
+                     acc[(y * w + x) * 3 + k] += (PORTAL_RT_LM_GET(bits[y * row + x], k) * inten) >> 8;
+      }
+      ++idx;
+      mask >>= 1;
+   }
+   for (y = -1; y <= h; ++y)
+      for (x = -1; x <= w; ++x) {
+         const int sx = x < 0 ? 0 : x >= w ? w - 1 : x, sy = y < 0 ? 0 : y >= h ? h - 1 : y;
+         uchar *o = out + ((y + 1) * W + (x + 1)) * 4;
+         for (k = 0; k < 3; ++k) {
+            int v = acc[(sy * w + sx) * 3 + k];
+            if (v > PORTAL_RT_LM_MAX)
+               v = PORTAL_RT_LM_MAX;
+            o[k] = (uchar)(v * 255 / PORTAL_RT_LM_MAX);
+         }
+         o[3] = 255;
+      }
+}
+
+// the polygon's lightmap onto a page, and where it lies there for each corner
+// (the lightmap-only pass's mapping, ptdrawhw.c: a lightmap texel every quarter
+// of a texture unit, from its base); 0 if it has none (or no room is left)
+static int portal_rt_lm_polygon(int c, int p, PortalCell *r, PortalPolygonRenderInfo *ri,
+                                const mxs_vector *anchor, int voff, int n, float *lmuv, int *page)
+{
+   static uchar pixels[66 * 66 * 4];
+   PortalLightMap *lt;
+   mxs_real uvdot, u2, v2, tbu, tbv;
+   int i, x, y, pg;
+   if (!r->light_list || p >= r->num_render_polys)
+      return 0;
+   lt = &r->light_list[p];
+   if (!lt->data || lt->w == 0 || lt->h == 0 || lt->w > 64 || lt->h > 64)
+      return 0;
+   uvdot = mx_dot_vec(&ri->tex_u, &ri->tex_v);
+   u2 = mx_mag2_vec(&ri->tex_u);
+   v2 = mx_mag2_vec(&ri->tex_v);
+   if (u2 <= 0.0f || v2 <= 0.0f)
+      return 0;
+   pg = portal_rt_lm_alloc(lt->w + 2, lt->h + 2, &x, &y);
+   if (pg < 0)
+      return 0;
+   portal_rt_lm_pixels(r, lt, pixels);
+   RenderRTLightmapRect(pg, x, y, lt->w + 2, lt->h + 2, pixels);
+   {
+      int tx, ty;
+      for (ty = 1; ty <= lt->h; ++ty)
+         for (tx = 1; tx <= lt->w; ++tx) {
+            const uchar *o = pixels + (ty * (lt->w + 2) + tx) * 4;
+            const int l = (o[0] * 54 + o[1] * 183 + o[2] * 19) >> 8;
+            ++portal_rt_lm_hist[l >> 4];
+         }
+   }
+   ++portal_rt_lm_count;
+   portal_rt_lm_texels += (lt->w + 2) * (lt->h + 2);
+   if (lt->anim_light_bitmask) {
+      if (portal_rt_lm_anim_n >= portal_rt_lm_anim_cap) {
+         int cap = portal_rt_lm_anim_cap ? portal_rt_lm_anim_cap * 2 : 1024;
+         PortalRtLm *grown = (PortalRtLm *)realloc(portal_rt_lm_anim, cap * sizeof(PortalRtLm));
+         if (grown) {
+            portal_rt_lm_anim = grown;
+            portal_rt_lm_anim_cap = cap;
+         }
+      }
+      if (portal_rt_lm_anim_n < portal_rt_lm_anim_cap) {
+         PortalRtLm *a = &portal_rt_lm_anim[portal_rt_lm_anim_n++];
+         a->cell = c;
+         a->poly = (short)p;
+         a->page = (uchar)pg;
+         a->x = (ushort)x;
+         a->y = (ushort)y;
+      }
+   }
+   tbu = portal_wrext_u_base[c] ? portal_wrext_u_base[c][p] : ri->u_base / 4096.0f;
+   tbv = portal_wrext_v_base[c] ? portal_wrext_v_base[c][p] : ri->v_base / 4096.0f;
+   for (i = 0; i < n; ++i) {
+      mxs_vector *w = &r->vpool[r->vertex_list[voff + i]];
+      mxs_vector delta;
+      mxs_real du, dv, U, V;
+      mx_sub_vec(&delta, w, (mxs_vector *)anchor);
+      du = mx_dot_vec(&delta, &ri->tex_u);
+      dv = mx_dot_vec(&delta, &ri->tex_v);
+      if (uvdot == 0.0f) {
+         U = tbu + du / u2;
+         V = tbv + dv / v2;
+      } else {
+         const mxs_real denom = 1.0f / (u2 * v2 - uvdot * uvdot);
+         U = tbu + v2 * denom * du - denom * uvdot * dv;
+         V = tbv + u2 * denom * dv - denom * uvdot * du;
+      }
+      lmuv[i * 2] = (x + 1.5f + 4.0f * U - lt->base_u) / RENDER_RT_LIGHTMAP_PAGE;
+      lmuv[i * 2 + 1] = (y + 1.5f + 4.0f * V - lt->base_v) / RENDER_RT_LIGHTMAP_PAGE;
+   }
+   *page = pg;
+   return 1;
+}
+
+// every few frames: the lightmaps lit by animated lights that have changed
+// much since they were made (put out, switched, a lamp's flicker swinging far)
+static void portal_rt_lm_update(void)
+{
+   static uchar pixels[66 * 66 * 4];
+   int i, any = 0;
+   if (portal_rt_lm_anim_n <= 0 || !portal_anim_light_intensity ||
+       portal_rt_lm_used_n != num_anim_lights || (++portal_rt_lm_frame & 7))
+      return;
+   for (i = 0; i < num_anim_lights; ++i) {
+      const int a = portal_rt_lm_used[i], b = portal_anim_light_intensity[i];
+      const int d = a > b ? a - b : b - a;
+      portal_rt_lm_changed[i] = (uchar)(((a == 0) != (b == 0)) || d > 64);
+      if (portal_rt_lm_changed[i]) {
+         portal_rt_lm_used[i] = (uchar)b;
+         any = 1;
+      }
+   }
+   if (!any)
+      return;
+   for (i = 0; i < portal_rt_lm_anim_n; ++i) {
+      const PortalRtLm *a = &portal_rt_lm_anim[i];
+      PortalCell *r = (a->cell >= 0 && a->cell < wr_num_cells) ? WR_CELL(a->cell) : NULL;
+      PortalLightMap *lt;
+      uint mask;
+      ushort *idx;
+      int hit = 0;
+      if (!r || !r->light_list || !r->anim_light_index_list)
+         continue;
+      lt = &r->light_list[a->poly];
+      for (mask = lt->anim_light_bitmask, idx = r->anim_light_index_list; mask && !hit; mask >>= 1, ++idx)
+         if ((mask & 1) && *idx < num_anim_lights && portal_rt_lm_changed[*idx])
+            hit = 1;
+      if (!hit)
+         continue;
+      portal_rt_lm_pixels(r, lt, pixels);
+      RenderRTLightmapRect(a->page, a->x, a->y, lt->w + 2, lt->h + 2, pixels);
+   }
+}
+
+// A water surface with no texture where the mission has no water texture at
+// all (Black Parade's canals and falls: the game draws them as nothing) is
+// given one of the mission's own, unused: its green hardware water
+// (fam/waterhw/GRin), slowly scrolling in the path tracer -- not what the
+// author drew, but it reads as water. The ray tracer's texture, made from
+// the PCX once.
+#define PORTAL_RT_STAND_IN_WATER 0xffff
+static void *portal_rt_stand_in_water;
+static int portal_rt_stand_in_tried;
+
+static void *portal_rt_load_pcx(const char *path)
+{
+   FILE *f = fopen(path, "rb");
+   unsigned char head[128], *data = NULL, *rgba = NULL;
+   long size;
+   int w, h, bpl, x, y, at;
+   void *handle = NULL;
+   if (!f)
+      return NULL;
+   fseek(f, 0, SEEK_END);
+   size = ftell(f);
+   fseek(f, 0, SEEK_SET);
+   if (size < 128 + 769 || fread(head, 1, 128, f) != 128 || head[0] != 10 || head[2] != 1 ||
+       head[3] != 8 || head[65] != 1) {
+      fclose(f);
+      return NULL;
+   }
+   w = (head[8] | (head[9] << 8)) - (head[4] | (head[5] << 8)) + 1;
+   h = (head[10] | (head[11] << 8)) - (head[6] | (head[7] << 8)) + 1;
+   bpl = head[66] | (head[67] << 8);
+   data = (unsigned char *)malloc(size - 128);
+   if (w <= 0 || h <= 0 || w > 4096 || h > 4096 || bpl < w || !data ||
+       fread(data, 1, size - 128, f) != (size_t)(size - 128) || data[size - 128 - 769] != 12) {
+      free(data);
+      fclose(f);
+      return NULL;
+   }
+   fclose(f);
+   rgba = (unsigned char *)malloc(w * h * 4);
+   if (rgba) {
+      const unsigned char *pal = data + (size - 128 - 768);
+      const long end = size - 128 - 769;
+      at = 0;
+      for (y = 0; y < h; ++y) {
+         x = 0;
+         while (x < bpl && at < end) {
+            int run = 1, v = data[at++];
+            if ((v & 0xc0) == 0xc0 && at < end) {
+               run = v & 0x3f;
+               v = data[at++];
+            }
+            while (run-- > 0 && x < bpl) {
+               if (x < w) {
+                  unsigned char *d = rgba + (y * w + x) * 4;
+                  d[0] = pal[v * 3];
+                  d[1] = pal[v * 3 + 1];
+                  d[2] = pal[v * 3 + 2];
+                  d[3] = 255;
+               }
+               ++x;
+            }
+         }
+      }
+      handle = RenderBackendCreateTexture(w, h, rgba, w * 4);
+      mprintf("RT: untextured water: %s (%dx%d) in its place\n", path, w, h);
+   }
+   free(rgba);
+   free(data);
+   return handle;
+}
+
+static void *portal_rt_stand_in_water_texture(void)
+{
+   static const char *const names[] = {"fam/waterhw/GRin.PCX", "fam/waterhw/grin.pcx", "fam/waterhw/GRIN.PCX"};
+   const char *fm = getenv("DARK_FM_PATH");
+   int i;
+   if (portal_rt_stand_in_tried)
+      return portal_rt_stand_in_water;
+   portal_rt_stand_in_tried = 1;
+   for (i = 0; fm && fm[0] && i < (int)(sizeof(names) / sizeof(names[0])) && !portal_rt_stand_in_water; ++i) {
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/%s", fm, names[i]);
+      portal_rt_stand_in_water = portal_rt_load_pcx(path);
+   }
+   return portal_rt_stand_in_water;
+}
+
+static void portal_rt_submit_world(void)
+{
+   uint32 serial;
+   int c;
+
+   if (wr_num_cells <= 0)
+      return;
+   serial = portal_rt_world_serial();
+   if (RenderRTWorldWanted(serial)) {
+      float xyz[3 * 256], uv[2 * 256];
+      // A water surface with no texture (texture 0, as Black Parade's
+      // canals) borrows the mission's commonest water texture, drawn as the
+      // rest of its water is (through its medium's palette).
+      static unsigned short water_count[PORTAL_RT_MAX_TEXTURE_IDS];
+      int water_tex = -1;
+      memset(water_count, 0, sizeof(water_count));
+      for (c = 0; c < wr_num_cells; ++c) {
+         PortalCell *r = WR_CELL(c);
+         int p;
+         if (!r)
+            continue;
+         for (p = r->num_polys - r->num_portal_polys; p < r->num_render_polys; ++p) {
+            const int t = r->render_list[p].texture_id;
+            if (!portal_rt_is_sky(t) && t < PORTAL_RT_MAX_TEXTURE_IDS && portal_get_texture(t) &&
+                water_count[t] < 65535) {
+               ++water_count[t];
+               if (water_tex < 0 || water_count[t] > water_count[water_tex])
+                  water_tex = t;
+            }
+         }
+      }
+      // Each water cell's surface: the height of its openings onto the air
+      // above it (or, a cell deep under, of the water cells over it) -- the
+      // depth of what is under water, which the path tracer hazes by it,
+      // the water's own surface being drawn only where it has a texture
+      // (as the game draws it: an untextured one not at all)
+      static float *water_top = NULL;
+      static int water_top_n = 0;
+      if (water_top_n < wr_num_cells) {
+         free(water_top);
+         water_top = (float *)malloc(sizeof(float) * (wr_num_cells > 0 ? wr_num_cells : 1));
+         water_top_n = water_top ? wr_num_cells : 0;
+      }
+      if (water_top) {
+         int pass, any = 0;
+         for (c = 0; c < wr_num_cells; ++c) {
+            PortalCell *r = WR_CELL(c);
+            int p, voff = 0;
+            water_top[c] = -1e30f;
+            if (!r || r->medium != 2)
+               continue;
+            ++any;
+            for (p = 0; p < r->num_polys; voff += r->poly_list[p].num_vertices, ++p) {
+               PortalPolygonCore *pc = &r->poly_list[p];
+               PortalCell *d;
+               float z = 0;
+               int i;
+               if (p < r->num_polys - r->num_portal_polys || pc->destination >= wr_num_cells)
+                  continue;
+               d = WR_CELL(pc->destination);
+               if (!d || d->medium == 2 || pc->num_vertices < 3)
+                  continue;
+               for (i = 0; i < pc->num_vertices; ++i)
+                  z += r->vpool[r->vertex_list[voff + i]].z;
+               z /= pc->num_vertices;
+               if (z > water_top[c])
+                  water_top[c] = z;
+            }
+         }
+         if (any) {
+            // the water's colour (the mission's, as the game hazes it with)
+            for (c = 0; c < wr_num_cells; ++c) {
+               PortalCell *r = WR_CELL(c);
+               if (r && r->medium == 2) {
+                  const unsigned char *rgb =
+                     (const unsigned char *)GetWaterColorForBank(GetWaterBankForFlow(r->motion_index));
+                  if (rgb)
+                     RenderRTWorldWaterColor(rgb[0], rgb[1], rgb[2]);
+                  break;
+               }
+            }
+         }
+         for (pass = 0; pass < 16 && any; ++pass) {
+            int changed = 0;
+            for (c = 0; c < wr_num_cells; ++c) {
+               PortalCell *r = WR_CELL(c);
+               int p;
+               if (!r || r->medium != 2)
+                  continue;
+               for (p = r->num_polys - r->num_portal_polys; p < r->num_polys; ++p) {
+                  const int d = r->poly_list[p].destination;
+                  if (d < wr_num_cells && WR_CELL(d) && WR_CELL(d)->medium == 2 &&
+                      water_top[d] > water_top[c]) {
+                     water_top[c] = water_top[d];
+                     changed = 1;
+                  }
+               }
+            }
+            if (!changed)
+               break;
+         }
+      }
+      const int game_light = RenderRTLightmapWanted();
+      memset(portal_rt_texture_seen, 0, sizeof(portal_rt_texture_seen));
+      portal_rt_max_texture_id = -1;
+      RenderRTWorldBegin(serial);
+      portal_rt_lm_reset();
+      for (c = 0; c < wr_num_cells; ++c) {
+         PortalCell *r = WR_CELL(c);
+         int p, voff = 0;
+         int first_portal;
+         if (!r)
+            continue;
+         first_portal = r->num_polys - r->num_portal_polys;
+         RenderRTWorldCell(c);
+         for (p = 0; p < r->num_render_polys; voff += r->poly_list[p].num_vertices, ++p) {
+            PortalPolygonCore *pc = &r->poly_list[p];
+            PortalPolygonRenderInfo *ri = &r->render_list[p];
+            int n = pc->num_vertices, i, flags = 0;
+            const mxs_vector *anchor;
+            r3s_texture tex;
+            mxs_real u_scale = 1.0f, v_scale = 1.0f, u_base, v_base;
+            mxs_real uvdot, u2, v2;
+            int tid = ri->texture_id;
+            if (n < 3 || n > 256)
+               continue;
+            int stand_in = 0;
+            if (p >= first_portal && portal_rt_is_sky(tid) && water_tex >= 0)
+               tid = water_tex;
+            else if (p >= first_portal && portal_rt_is_sky(tid) && portal_rt_stand_in_water_texture())
+               stand_in = 1;   // (given as PORTAL_RT_STAND_IN_WATER, below)
+            // (a water surface -- a medium boundary -- is never a sky, though
+            // its texture number may be 0: Black Parade's canals, drawn as
+            // openings onto the sky, invisible. Without a texture of its own,
+            // the path tracer's water.)
+            if (p >= first_portal)
+               flags |= kRenderRTWorldWater;
+            else if (portal_rt_is_sky(tid))
+               flags |= kRenderRTWorldSky;
+            if (pc->flags & RENDER_DOESNT_LIGHT)
+               flags |= kRenderRTWorldFullbright;
+            tex = ((flags & kRenderRTWorldSky) || portal_rt_is_sky(tid))
+                     ? NULL : portal_get_texture(tid);
+            if (tex) {
+               if (tex->type != BMT_FLAT8 && tex->w > 0 && tex->h > 0) {
+                  // (wlog is of the row in bytes: twice the width at 16 bits)
+                  u_scale = 64.0f / tex->w;
+                  v_scale = 64.0f / tex->h;
+               } else {
+                  u_scale = (mxs_real)ldexp(1.0, 6 - tex->wlog);
+                  v_scale = (mxs_real)ldexp(1.0, 6 - tex->hlog);
+               }
+               if (tex->flags & BMF_TRANS)
+                  flags |= kRenderRTWorldTransparent;
+            }
+            u_scale /= portal_worldrep_texture_scale;
+            v_scale /= portal_worldrep_texture_scale;
+            u_base = (portal_wrext_u_base[c] ? portal_wrext_u_base[c][p]
+                                             : ri->u_base / 4096.0f) * u_scale;
+            v_base = (portal_wrext_v_base[c] ? portal_wrext_v_base[c][p]
+                                             : ri->v_base / 4096.0f) * v_scale;
+            anchor = &r->vpool[r->vertex_list[voff + ri->texture_anchor]];
+            uvdot = mx_dot_vec(&ri->tex_u, &ri->tex_v);
+            u2 = mx_mag2_vec(&ri->tex_u);
+            v2 = mx_mag2_vec(&ri->tex_v);
+            for (i = 0; i < n; ++i) {
+               mxs_vector *w = &r->vpool[r->vertex_list[voff + i]];
+               mxs_vector delta;
+               mxs_real du, dv;
+               xyz[i*3] = w->x; xyz[i*3+1] = w->y; xyz[i*3+2] = w->z;
+               mx_sub_vec(&delta, w, (mxs_vector *)anchor);
+               du = mx_dot_vec(&delta, &ri->tex_u);
+               dv = mx_dot_vec(&delta, &ri->tex_v);
+               if (u2 <= 0.0f || v2 <= 0.0f) {
+                  // (no mapping of its own -- a borrowed water texture: laid
+                  // flat, a tile every 4 feet)
+                  uv[i*2] = (tid != ri->texture_id || stand_in) ? w->x * 0.25f : 0.0f;
+                  uv[i*2+1] = (tid != ri->texture_id || stand_in) ? w->y * 0.25f : 0.0f;
+               } else if (uvdot == 0.0f) {
+                  uv[i*2]   = du * u_scale / u2 + u_base;
+                  uv[i*2+1] = dv * v_scale / v2 + v_base;
+               } else {
+                  mxs_real denom = 1.0f / (u2*v2 - uvdot*uvdot);
+                  uv[i*2]   = u_base + (v2*v_scale*denom) * du - (u_scale*denom*uvdot) * dv;
+                  uv[i*2+1] = v_base + (u2*u_scale*denom) * dv - (v_scale*denom*uvdot) * du;
+               }
+            }
+            if (flags & kRenderRTWorldWater)
+               for (i = 0; i < 2 * n; ++i)
+                  uv[i] *= hw_water_tex_scale;   // as ptdrawhw.c draws water
+            {
+               // the texture's material (.mtl): an HD replacement laid at its
+               // terrain_scale, and its tile_factor -- as lgd3d draws it
+               float su = 1.0f, sv = 1.0f;
+               r3s_texture ttex = portal_get_texture(tid);
+               if (ttex)
+                  ResMaterialUvScale(ttex, &su, &sv);
+               if (su != 1.0f || sv != 1.0f)
+                  for (i = 0; i < n; ++i) {
+                     uv[i*2] *= su;
+                     uv[i*2+1] *= sv;
+                  }
+            }
+            {
+               const PortalPlane *pl = &r->plane_list[pc->planeid];
+               RenderRTWorldPolygonFacing(pl->normal.x, pl->normal.y, pl->normal.z);
+            }
+            if (game_light && !(flags & (kRenderRTWorldSky | kRenderRTWorldWater | kRenderRTWorldFullbright)) &&
+                !portal_rt_is_sky(tid)) {
+               float lmuv[2 * 256];
+               int page;
+               if (portal_rt_lm_polygon(c, p, r, ri, anchor, voff, n, lmuv, &page))
+                  RenderRTWorldPolygonLight(page, n, lmuv);
+            }
+            if (!(flags & kRenderRTWorldWater) && r->medium == 2 && water_tex < 0 && water_top &&
+                water_top[c] > -1e29f) {
+               // (how far under the water's surface it lies, in feet)
+               float z = 0;
+               for (i = 0; i < n; ++i)
+                  z += xyz[i * 3 + 2];
+               z /= n;
+               if (water_top[c] - z > 0.0f)
+                  RenderRTWorldPolygonUnderWater(water_top[c] - z);
+            }
+            if ((flags & kRenderRTWorldWater) && r->medium == 2)
+               RenderRTWorldPolygonUnderside();
+            RenderRTWorldPolygon(stand_in ? PORTAL_RT_STAND_IN_WATER : tid, flags, n, xyz, uv);
+            if (!(flags & kRenderRTWorldSky) && !portal_rt_is_sky(tid) &&
+                tid < PORTAL_RT_MAX_TEXTURE_IDS) {
+               // 2: a water surface, drawn through its medium's palette
+               portal_rt_texture_seen[tid] =
+                  (flags & kRenderRTWorldWater) ? 2 : 1;
+               if (tid > portal_rt_max_texture_id)
+                  portal_rt_max_texture_id = tid;
+            }
+         }
+      }
+      RenderRTWorldEnd();
+      if (game_light) {
+         int total = 0, i, run = 0, pc = 0;
+         static const int want[5] = {10, 25, 50, 75, 90};
+         int at[5] = {0, 0, 0, 0, 0};
+         mprintf("RT: the game's light: %d lightmaps on %d pages (%d%% of the last), %d lit by animated lights\n",
+                 portal_rt_lm_count, portal_rt_lm_count ? portal_rt_lm_page + 1 : 0,
+                 portal_rt_lm_count ? (portal_rt_lm_y + portal_rt_lm_shelf) * 100 / RENDER_RT_LIGHTMAP_PAGE : 0,
+                 portal_rt_lm_anim_n);
+         for (i = 0; i < 16; ++i)
+            total += portal_rt_lm_hist[i];
+         for (i = 0; i < 16 && total > 0; ++i) {
+            run += portal_rt_lm_hist[i];
+            while (pc < 5 && run * 100 >= want[pc] * total)
+               at[pc++] = i * 16 + 15;
+         }
+         // (luma 0..255: the shader takes under ~10 as dark, over ~77 as lit)
+         mprintf("RT: the game's light, how bright: 10%% of texels under %d, 25%% under %d, half under %d, 75%% under %d, 90%% under %d (0..255)\n",
+                 at[0], at[1], at[2], at[3], at[4]);
+      }
+   }
+   portal_rt_lm_update();
+
+   // the current frame of every world texture
+   for (c = 0; c <= portal_rt_max_texture_id; ++c) {
+      if (portal_rt_texture_seen[c]) {
+         r3s_texture tex = portal_get_texture(c);
+         void *handle = NULL;
+         if (tex && portal_rt_texture_seen[c] == 2)
+            handle = portal_rt_water_texture(tex);
+         if (tex && !handle)
+            handle = lgd3d_rt_texture_for_bitmap(tex);
+         RenderRTWorldTexture(c, handle);
+      }
+   }
+   if (portal_rt_stand_in_water)
+      RenderRTWorldTexture(PORTAL_RT_STAND_IN_WATER, portal_rt_stand_in_water);
+   portal_rt_submit_skybox();
+}
+
+// Which static lights can matter for this view: the lights the level's
+// lighting found shining on the cells around the camera (reached through
+// portals, within a radius, in view or not: bounce light and shadows come from
+// there too) and on the cells drawn last frame (a lit street seen far away).
+// The ray tracer is given only these, so its few candidate lights per pixel
+// are not spent on lamps behind the walls.
+#define PORTAL_RT_LIGHT_BITS 65536
+static unsigned char portal_rt_light_bits[PORTAL_RT_LIGHT_BITS / 8];
+static unsigned int *portal_rt_cell_stamp;
+static unsigned int *portal_rt_drawn;   // = portal_rt_stamp: drawn last frame
+static int portal_rt_drawn_size;
+static int portal_rt_cell_stamp_size;
+static unsigned int portal_rt_stamp;
+
+static int portal_rt_stat_cells, portal_rt_stat_entries, portal_rt_stat_max;
+
+static void portal_rt_mark_cell_lights(int c)
+{
+   ushort *lt;
+   int k, n;
+   if (c < 0 || c >= wr_num_cells || !WR_CELL(c))
+      return;
+   // animated lights (torches that can be doused, switched lamps) are kept
+   // in a list of their own, not in light_indices
+   if (WR_CELL(c)->anim_light_index_list)
+      for (k = 0; k < WR_CELL(c)->num_anim_lights; ++k) {
+         const ushort l = WR_CELL(c)->anim_light_index_list[k];
+         portal_rt_light_bits[l >> 3] |= (unsigned char)(1 << (l & 7));
+      }
+   lt = WR_CELL(c)->light_indices;
+   if (!lt)
+      return;
+   n = lt[0];
+   ++portal_rt_stat_cells;
+   portal_rt_stat_entries += n;
+   if (n > portal_rt_stat_max)
+      portal_rt_stat_max = n;
+   for (k = 1; k <= n; ++k)
+      portal_rt_light_bits[lt[k] >> 3] |= (unsigned char)(1 << (lt[k] & 7));
+}
+
+static void portal_rt_find_lights(int start)
+{
+   static int *queue;
+   static int queue_size;
+   const float radius = 30.0f / 0.3048f;   // metres, in Dark units
+   int head = 0, tail = 0, i, visible = 0;
+   static int frames;
+   memset(portal_rt_light_bits, 0, sizeof(portal_rt_light_bits));
+   portal_rt_stat_cells = portal_rt_stat_entries = portal_rt_stat_max = 0;
+   if (wr_num_cells <= 0)
+      return;
+   if (portal_rt_cell_stamp_size < wr_num_cells) {
+      free(portal_rt_cell_stamp);
+      free(queue);
+      portal_rt_cell_stamp = (unsigned int *)calloc(wr_num_cells, sizeof(unsigned int));
+      queue = (int *)malloc(sizeof(int) * wr_num_cells);
+      portal_rt_cell_stamp_size = portal_rt_cell_stamp ? wr_num_cells : 0;
+      queue_size = wr_num_cells;
+      if (!portal_rt_cell_stamp || !queue)
+         return;
+   }
+   if (portal_rt_drawn_size < wr_num_cells) {
+      free(portal_rt_drawn);
+      portal_rt_drawn = (unsigned int *)calloc(wr_num_cells, sizeof(unsigned int));
+      portal_rt_drawn_size = portal_rt_drawn ? wr_num_cells : 0;
+   }
+   if (++portal_rt_stamp == 0) {
+      if (portal_rt_drawn)
+         memset(portal_rt_drawn, 0, sizeof(unsigned int) * portal_rt_drawn_size);
+      memset(portal_rt_cell_stamp, 0, sizeof(unsigned int) * portal_rt_cell_stamp_size);
+      portal_rt_stamp = 1;
+   }
+   for (i = 0; i < r_sorted_count && i < MAX_ACTIVE_REGIONS; ++i) {
+      portal_rt_mark_cell_lights(active_regions[i]);
+      if (active_regions[i] >= 0 && active_regions[i] < portal_rt_drawn_size)
+         portal_rt_drawn[active_regions[i]] = portal_rt_stamp;
+   }
+   visible = portal_rt_stat_cells;
+   if (start < 0 || start >= wr_num_cells || !WR_CELL(start))
+      return;
+   queue[tail++] = start;
+   portal_rt_cell_stamp[start] = portal_rt_stamp;
+   while (head < tail) {
+      PortalCell *cell = WR_CELL(queue[head++]);
+      PortalPolygonCore *portal = cell->portal_poly_list;
+      int n = cell->num_portal_polys;
+      portal_rt_mark_cell_lights(queue[head - 1]);
+      while (n-- > 0) {
+         const int d = portal->destination;
+         ++portal;
+         if (d < 0 || d >= wr_num_cells || portal_rt_cell_stamp[d] == portal_rt_stamp || !WR_CELL(d))
+            continue;
+         portal_rt_cell_stamp[d] = portal_rt_stamp;
+         {
+            const mxs_vector *c = &WR_CELL(d)->sphere_center;
+            const float dx = c->x - portal_camera_loc.x, dy = c->y - portal_camera_loc.y,
+                        dz = c->z - portal_camera_loc.z;
+            const float r = radius + WR_CELL(d)->sphere_radius;
+            if (dx * dx + dy * dy + dz * dz > r * r)
+               continue;
+         }
+         if (tail < queue_size)
+            queue[tail++] = d;
+      }
+   }
+   if (++frames % 300 == 1) {
+      int marked = 0;
+      for (i = 0; i < PORTAL_RT_LIGHT_BITS; ++i)
+         marked += (portal_rt_light_bits[i >> 3] >> (i & 7)) & 1;
+      fprintf(stderr, "RT: light reach: camera cell %d of %d, %d drawn cells, %d cells within 30 m, "
+                      "%d lights marked; cells list %.1f lights on average, at most %d\n",
+              start, wr_num_cells, visible, tail, marked,
+              portal_rt_stat_cells ? (double)portal_rt_stat_entries / portal_rt_stat_cells : 0.0,
+              portal_rt_stat_max);
+   }
+}
+
+// The distance from the camera to each cell walking through the openings
+// between cells (Raze RT's light reach, in Dark units), for fading lights out
+// smoothly with their distance -- a light more than a few rooms' walk away
+// fades out, instead of a fixed number of lights being taken nearest first,
+// whose list changed as you walked: lights that came and went right ahead.
+static float *portal_rt_cell_dist;      // < 0: not reached
+static mxs_vector *portal_rt_cell_entry;
+static int portal_rt_dist_size;
+static float portal_rt_dist_limit;
+
+static void portal_rt_compute_reach(int start, float limit)
+{
+   static int *heap;       // cells, by distance (a binary heap)
+   static int heap_cap;
+   int n = 0, i;
+   // The distances change little until the camera has moved: worked out
+   // again only when it is in another cell or a foot from where they were
+   // last measured (a city's 90 m of portals each frame cost milliseconds).
+   static int last_start = -1, last_cells = -1;
+   static PortalCell *last_world = NULL;
+   static mxs_vector last_cam;
+   static float last_limit = -1.0f;
+   if (start == last_start && wr_num_cells == last_cells && wr_num_cells > 0 && wr_cell[0] == last_world &&
+       limit == last_limit && portal_rt_dist_size >= wr_num_cells &&
+       mx_dist2_vec(&portal_camera_loc, &last_cam) < 1.0f)
+      return;
+   last_start = start;
+   last_cells = wr_num_cells;
+   last_world = wr_num_cells > 0 ? wr_cell[0] : NULL;
+   last_cam = portal_camera_loc;
+   last_limit = limit;
+   portal_rt_dist_limit = limit;
+   if (wr_num_cells <= 0)
+      return;
+   if (portal_rt_dist_size < wr_num_cells) {
+      free(portal_rt_cell_dist);
+      free(portal_rt_cell_entry);
+      portal_rt_cell_dist = (float *)malloc(sizeof(float) * wr_num_cells);
+      portal_rt_cell_entry = (mxs_vector *)malloc(sizeof(mxs_vector) * wr_num_cells);
+      portal_rt_dist_size = (portal_rt_cell_dist && portal_rt_cell_entry) ? wr_num_cells : 0;
+   }
+   if (!portal_rt_dist_size)
+      return;
+   for (i = 0; i < wr_num_cells; ++i)
+      portal_rt_cell_dist[i] = -1.0f;
+   if (start < 0 || start >= wr_num_cells || !WR_CELL(start))
+      return;
+   if (heap_cap < wr_num_cells * 4) {
+      free(heap);
+      heap_cap = wr_num_cells * 4;
+      heap = (int *)malloc(sizeof(int) * heap_cap);
+      if (!heap) {
+         heap_cap = 0;
+         return;
+      }
+   }
+#define RT_HD(k) portal_rt_cell_dist[heap[k]]
+   portal_rt_cell_dist[start] = 0.0f;
+   portal_rt_cell_entry[start] = portal_camera_loc;
+   heap[n++] = start;
+   while (n > 0) {
+      const int c = heap[0];
+      PortalCell *cell = WR_CELL(c);
+      PortalPolygonCore *poly;
+      int np, v, k;
+      // pop
+      heap[0] = heap[--n];
+      for (k = 0;;) {
+         int a = 2 * k + 1, b = a + 1, m = k, t;
+         if (a < n && RT_HD(a) < RT_HD(m)) m = a;
+         if (b < n && RT_HD(b) < RT_HD(m)) m = b;
+         if (m == k) break;
+         t = heap[k]; heap[k] = heap[m]; heap[m] = t;
+         k = m;
+      }
+      if (!cell)
+         continue;
+      poly = cell->portal_poly_list;
+      np = cell->num_portal_polys;
+      v = cell->portal_vertex_list;
+      while (np-- > 0) {
+         const int d = poly->destination;
+         mxs_vector mid;
+         float nd, dx, dy, dz;
+         int j;
+         mid.x = mid.y = mid.z = 0.0f;
+         for (j = 0; j < poly->num_vertices; ++j) {
+            const mxs_vector *pt = &cell->vpool[cell->vertex_list[v + j]];
+            mid.x += pt->x; mid.y += pt->y; mid.z += pt->z;
+         }
+         if (poly->num_vertices > 0) {
+            mid.x /= poly->num_vertices; mid.y /= poly->num_vertices; mid.z /= poly->num_vertices;
+         }
+         v += poly->num_vertices;
+         ++poly;
+         if (d < 0 || d >= wr_num_cells || !WR_CELL(d))
+            continue;
+         dx = mid.x - portal_rt_cell_entry[c].x;
+         dy = mid.y - portal_rt_cell_entry[c].y;
+         dz = mid.z - portal_rt_cell_entry[c].z;
+         nd = portal_rt_cell_dist[c] + (float)sqrt(dx * dx + dy * dy + dz * dz);
+         if (nd > limit)
+            continue;
+         if (portal_rt_cell_dist[d] >= 0.0f && nd >= portal_rt_cell_dist[d])
+            continue;
+         portal_rt_cell_dist[d] = nd;
+         portal_rt_cell_entry[d] = mid;
+         if (n < heap_cap) {
+            // push (a cell may be in the heap twice; the later copy is stale but harmless)
+            k = n++;
+            heap[k] = d;
+            while (k > 0 && RT_HD((k - 1) / 2) > RT_HD(k)) {
+               const int pk = (k - 1) / 2, t = heap[k];
+               heap[k] = heap[pk]; heap[pk] = t;
+               k = pk;
+            }
+         }
+      }
+   }
+#undef RT_HD
+}
+
+// A cell's walking distance from the camera (Dark units), 0 if it is drawn on
+// screen, < 0 beyond reach (90 m): the ray tracer leaves far rooms out.
+float portal_rt_cell_walk(int cell)
+{
+   if (cell < 0)
+      return -1.0f;
+   if (cell < portal_rt_drawn_size && portal_rt_drawn[cell] == portal_rt_stamp)
+      return 0.0f;
+   if (!portal_rt_dist_size || cell >= portal_rt_dist_size)
+      return -1.0f;
+   return portal_rt_cell_dist[cell];
+}
+
+// a point's walking distance from the camera (Dark units), < 0 if beyond reach.
+// As Blood RT's: one in a cell drawn on screen counts as far as it is in a
+// straight line over 2.5 (a lamp down a long street, seen, is in reach).
+float portal_rt_path_distance(int cell, const mxs_vector *pos)
+{
+   float dx, dy, dz, walk = -1.0f;
+   if (!portal_rt_dist_size || cell < 0 || cell >= portal_rt_dist_size)
+      return -1.0f;
+   if (portal_rt_cell_dist[cell] >= 0.0f) {
+      dx = pos->x - portal_rt_cell_entry[cell].x;
+      dy = pos->y - portal_rt_cell_entry[cell].y;
+      dz = pos->z - portal_rt_cell_entry[cell].z;
+      walk = portal_rt_cell_dist[cell] + (float)sqrt(dx * dx + dy * dy + dz * dz);
+   }
+   if (cell < portal_rt_drawn_size && portal_rt_drawn[cell] == portal_rt_stamp) {
+      float seen;
+      dx = pos->x - portal_camera_loc.x;
+      dy = pos->y - portal_camera_loc.y;
+      dz = pos->z - portal_camera_loc.z;
+      seen = (float)sqrt(dx * dx + dy * dy + dz * dz) / 2.5f;
+      if (walk < 0.0f || seen < walk)
+         walk = seen;
+   }
+   return walk;
+}
+
+int portal_rt_light_relevant(int light)
+{
+   if (light < 0 || light >= PORTAL_RT_LIGHT_BITS)
+      return 1;
+   return (portal_rt_light_bits[light >> 3] >> (light & 7)) & 1;
+}
+
+// ---- the OpenGL renderer's real-time lights ----------------------------------
+static void portal_rt_begin(float zoom, int cell)
+{
+   mxs_matrix *slew;
+   float p[3], f[3], l[3], u[3];
+   if (!RenderRTActive())
+      return;
+   slew = r3_get_slew_matrix();
+   p[0] = portal_camera_loc.x; p[1] = portal_camera_loc.y; p[2] = portal_camera_loc.z;
+   f[0] = slew->vec[0].x; f[1] = slew->vec[0].y; f[2] = slew->vec[0].z;
+   l[0] = slew->vec[1].x; l[1] = slew->vec[1].y; l[2] = slew->vec[1].z;
+   u[0] = slew->vec[2].x; u[1] = slew->vec[2].y; u[2] = slew->vec[2].z;
+   RenderRTSceneBegin(p, f, l, u, zoom, grd_bm.w, grd_bm.h);
+   // MEDIA_WATER (engfeat/media.h) is 2
+   RenderRTCameraMedium(cell >= 0 && cell < wr_num_cells && WR_CELL(cell) &&
+                        WR_CELL(cell)->medium == 2);
+   {
+      const float fog[3] = {(float)portal_fog_color[0], (float)portal_fog_color[1],
+                            (float)portal_fog_color[2]};
+      RenderRTFog(fog, portal_fog_on ? portal_fog_dist : 0.0f);
+   }
+   RenderRTPrepBegin();
+   portal_rt_submit_world();
+   RenderRTPrepMark(0);
+   portal_rt_find_lights(cell);
+   RenderRTPrepMark(1);
+   portal_rt_compute_reach(cell, 90.0f / 0.3048f);
+   RenderRTPrepMark(2);
+   objlight_rt_submit();
+   RenderRTPrepMark(3);
+   RenderRTPrepEnd();
+}
+#endif
+
+#ifdef DARK_RT
+#include <time.h>
+// Where the game's view spends its frame, for the performance log
+// (rtgl1.cpp): seconds summed, until the log takes them -- 0 finding the
+// cells in view, 1 sorting them and finding their objects, 2 their light
+// maps, 3 drawing them (their objects: the walls and floors are not drawn),
+// 4 after them (see-through objects, particles, overlays), 5 the objects
+// out of view drawn for their shadows
+double g_PortalPartSeconds[6];
+static double portal_part_clock(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+#define PORTAL_PART(i) do { const double now_ = portal_part_clock(); \
+   g_PortalPartSeconds[i] += now_ - portal_part_last; portal_part_last = now_; } while (0)
+#else
+#define PORTAL_PART(i) ((void)0)
+#endif
+
 void portal_render_scene(Position *pos, float zoom)
 {  PROF
    Location *loc = &pos->loc;
@@ -1673,6 +2722,10 @@ void portal_render_scene(Position *pos, float zoom)
 
    portal_start_3d(pos);
    r3_set_zoom (zoom);
+#ifdef DARK_RT
+   portal_rt_begin(zoom, cell);
+   double portal_part_last = portal_part_clock();
+#endif
 
      // tell the scene clipper to clear its clipinfo
 
@@ -1712,6 +2765,7 @@ void portal_render_scene(Position *pos, float zoom)
 
    // do the traversal of all visible cells
    portal_traverse_scene(cell);
+   PORTAL_PART(0);
 
    if (portal_pre_draw_callback != NULL)
       portal_pre_draw_callback();
@@ -1781,13 +2835,23 @@ void portal_render_scene(Position *pos, float zoom)
    // opposite--this is a useful debugging tool to show you how much
    // stuff is being processed.
 
+   PORTAL_PART(1);
    portal_mip_setup(zoom);
 
-   if ((g_lgd3d)&&(!punt_hardware_lighting)) {
+   // (not under the path tracer: these are the light map textures the
+   // engine's own drawing of the walls and floors uses, and it does not draw
+   // them -- see draw_region_lgd3d; the path tracer's light maps are its
+   // own, made with the world. 4 ms a frame at Reflections in Red's vista.)
+   if ((g_lgd3d)&&(!punt_hardware_lighting)
+#ifdef DARK_RT
+       && !RenderRTActive()
+#endif
+      ) {
       for (i=0; i < r_sorted_count; i++)
          portal_preload_lightmaps(active_regions[i]);
       porthw_end_frame();
    }
+   PORTAL_PART(2);
 
    if (g_lgd3d && portal_fog_on) {
       if (portal_fog_dist) {
@@ -1812,7 +2876,12 @@ void portal_render_scene(Position *pos, float zoom)
             draw_region_lgd3d(active_regions[i]);
          }
          // now render lightmaps if we're z buffering
-         if (g_zbuffer && !portal_multitexture && (!punt_hardware_lighting)) {
+         // (not under the path tracer: see draw_region_lgd3d)
+         if (g_zbuffer && !portal_multitexture && (!punt_hardware_lighting)
+#ifdef DARK_RT
+             && !RenderRTActive()
+#endif
+            ) {
             lgd3d_set_zcompare(TRUE);
             lgd3d_set_zwrite(FALSE);
             lgd3d_blend_multiply(portal_hack_blend);
@@ -1868,6 +2937,7 @@ void portal_render_scene(Position *pos, float zoom)
 #ifdef STATS_ON
    stat_num_render_ms = portal_get_time() - stat_num_render_ms;
 #endif
+   PORTAL_PART(3);
 
 cleanup:
    if (ptsky_type == PTSKY_SPAN)
@@ -1882,6 +2952,11 @@ cleanup:
 
    g2pt_post_render_polys();
 
+#ifdef DARK_RT
+   {
+      // deferred (translucent) objects, particles and overlays are objects
+      const int rt_suppressed = RenderRTSuppressCapture(0);
+#endif
    if (portal_post_render_cback)
       portal_post_render_cback();
 
@@ -1890,12 +2965,32 @@ cleanup:
 
    if (portal_render_overlays_cback)
       portal_render_overlays_cback();
+#ifdef DARK_RT
+      RenderRTSuppressCapture(rt_suppressed);
+   }
+#endif
 
 #ifndef SHIP
    if (portal_test_blend)
       portal_do_blendtest();
 #endif
 
+#ifdef DARK_RT
+   if (cell != CELL_INVALID)
+      PORTAL_PART(4);
+   {
+      // nearby objects out of view: their shadows and the light they block
+      const int rt_suppressed = RenderRTSuppressCapture(0);
+      RenderRTPrepBegin();
+      RenderRTGameDrawExtraObjects();
+      RenderRTPrepMark(4);
+      RenderRTPrepEnd();
+      RenderRTSuppressCapture(rt_suppressed);
+   }
+   if (cell != CELL_INVALID)
+      PORTAL_PART(5);
+   RenderRTSceneEnd();
+#endif
    portal_end_3d();
 
 #ifndef SHIP

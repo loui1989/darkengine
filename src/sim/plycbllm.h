@@ -32,6 +32,16 @@ EXTERN int  PlayerGetMode();
 EXTERN int  PlayerGetNextMode();
 
 EXTERN ObjID PlayerArm();
+#ifdef DARK_RT
+// Garrett's body double for the ray tracer's shadow and reflection of him
+// (OBJ_NULL when there is none)
+EXTERN ObjID PlayerBodyDouble();
+// whether the double's model holds what he holds (its weapon drawn)
+EXTERN BOOL PlayerBodyShowsWeapon();
+// what the double holds that its model has not (his blackjack), put in its
+// hand: OBJ_NULL when nothing
+EXTERN ObjID PlayerBodyHeldItem();
+#endif
 
 // schema utility funcs
 //

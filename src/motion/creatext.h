@@ -41,6 +41,27 @@ EXTERN BOOL CreatureSelfPropelled(const ObjID objID);
 EXTERN void CreatureFreeze(ObjID objID);
 
 EXTERN void CreatureUnFreeze(ObjID objID);
+#ifdef DARK_RT
+// the creature moved (its position set) next takes the height it is given,
+// even mid-motion (a small move up or down otherwise keeps its motion's);
+// OBJ_NULL for none
+EXTERN void CreatureFreeHeight(ObjID objID);
+// a creature's pose reshaped after each update that moved it: its joints'
+// world positions and orientations, and their orientations relative to
+// their parents' (quat *, the mesh's stretchy parts drawn by these) -- the
+// hook keeps all three agreeing. One creature at a time; OBJ_NULL for none.
+typedef void (*tCreaturePoseHook)(ObjID obj, int nJoints, mxs_vector *joints, mxs_matrix *orients,
+                                  void *relOrients, const int *parents);
+EXTERN void CreatureSetPoseHook(ObjID obj, tCreaturePoseHook hook);
+// its motion's own relative orientations back (before a new maneuver: the
+// motion library blends from them -- reshaped, it reshaped them twice)
+EXTERN void CreaturePoseUndo(ObjID obj);
+// reshaped again, if its joints were set since without the hook (a new
+// maneuver starting poses it at once, outside its update: drawn so, it
+// stood up for a frame each time its motion looped)
+EXTERN void CreaturePoseReapply(ObjID obj);
+EXTERN int CreaturePoseApplied();
+#endif   // (how many reshapings so far)
 
 EXTERN BOOL CreatureGetRenderHandle(const ObjID objID, long *pHandle);
 

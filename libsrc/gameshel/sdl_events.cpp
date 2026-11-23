@@ -247,8 +247,11 @@ private:
       }
       if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP)
       {
-         const uchar scan = KeyScan(event.key.scancode);
          const bool down = event.type == SDL_EVENT_KEY_DOWN;
+         // (the renderer's own keys first: the path tracer's settings panel)
+         if (DarkRenderHandleKey(event.key.scancode, event.key.mod, down, event.key.repeat))
+            return;
+         const uchar scan = KeyScan(event.key.scancode);
          if (scan != KBC_NONE && (!event.key.repeat || !SDLDisplayRelativeMouseActive()))
             DarkInputKey(scan, down);
       }

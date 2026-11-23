@@ -27,6 +27,12 @@ extern "C"
    void ResMaterialReset(void);
    // Lazily locked illumination image. Owned by the base material until Forget.
    struct grs_bitmap *ResMaterialIllumination(const struct grs_bitmap *bitmap);
+#ifdef DARK_RT
+   // For the path tracer: an image's name from its resource root ("fam/mech/dal01")
+   // and its material's illum_map (strength, 0 none; its texture's name). 0: not known.
+   int ResImageSourceInfo(const struct grs_bitmap *bitmap, char *name, int nameSize,
+                          float *illumination, char *illuminationMap, int mapSize);
+#endif
 #ifdef __cplusplus
 }
 struct IRes;

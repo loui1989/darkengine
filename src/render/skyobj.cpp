@@ -11,6 +11,7 @@
 #include <lg.h>
 #include <lgd3d.h>
 #include <r3d.h>
+#include <skypoly.h>
 #include <filevar.h>
 #include <sdesbase.h>
 #include <sdesc.h>
@@ -619,7 +620,7 @@ void cSky::Render()
             ((goddamn_stupid_r3s_point *)(PolyPoints[2]))->grp.d = UseColor[2].z;
 
             r3d_do_setup = TRUE;
-            r3_draw_poly(3, PolyPoints);
+            SKY_DRAW_POLY(3, PolyPoints);
          }
       }
    }
@@ -679,7 +680,7 @@ void cSky::Render()
             ((goddamn_stupid_r3s_point *)(PolyPoints[3]))->grp.d = UseColor[3].z;
 
             r3d_do_setup = TRUE;
-            r3_draw_poly(4, PolyPoints);
+            SKY_DRAW_POLY(4, PolyPoints);
          }
       }
    }

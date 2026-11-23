@@ -5,9 +5,11 @@
 # time from the "rt" folder (see libsrc/lgd3d/rt/rtgl1.cpp), and the game uses it
 # when THIEF_RT=1 is set; otherwise the Vulkan renderer runs as usual.
 #
-#   macOS: RTGL1 built with its native Metal backend (RG_WITH_METAL), as in
-#          https://github.com/loui1989/RayTracedGL1 (branch thief-mac).
-#   Windows / Linux: RTGL1's Vulkan backend.
+# The RTGL1 to use is https://github.com/loui1989/RayTracedGL1 (branch thief):
+#   macOS: built with its native Metal backend (RG_WITH_METAL).
+#   Windows: its Vulkan backend (x64 only); tools/rt/build-windows.ps1 builds it
+#            and the game and puts the rt folder next to thief-runner.exe.
+# See docs/path-tracer.md.
 set(DARK_RTGL1_INCLUDE "" CACHE PATH
   "RTGL1 include folder (the one holding RTGL1/RTGL1.h): compiles in the path tracer")
 
@@ -19,6 +21,9 @@ if(DARK_RTGL1_INCLUDE)
   endif()
   if(ANDROID)
     message(FATAL_ERROR "The path tracer is not supported on Android")
+  endif()
+  if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR "The path tracer needs a 64-bit build (RTGL1 is x64 / arm64 only)")
   endif()
   set(DARK_RT ON)
   target_compile_definitions(dark_engine_config INTERFACE DARK_RT=1)

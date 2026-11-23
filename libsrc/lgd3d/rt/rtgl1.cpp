@@ -110,6 +110,7 @@ extern "C" int ResImageSourceInfo(const void *bitmap, char *name, int nameSize,
 #define strncasecmp _strnicmp
 static inline int rt_mkdir(const char *path) { return _mkdir(path); }
 static inline int setenv(const char *name, const char *value, int) { return _putenv_s(name, value); }
+static inline int unsetenv(const char *name) { return _putenv_s(name, ""); }
 static inline char *realpath(const char *path, char *resolved) { return _fullpath(resolved, path, PATH_MAX); }
 #define RT_LIBRARY_FILE "RTGL1.dll"
 #else
@@ -128,6 +129,11 @@ static inline int rt_mkdir(const char *path) { return mkdir(path, 0755); }
 #include <render_rt.h>
 #include "rt_backend_internal.h"
 #include "rt_font.h"
+#if defined(_WIN32)
+// (<windows.h>'s old segment keywords, which the names below use)
+#undef near
+#undef far
+#endif
 extern "C" int PlatformGetExecutableDirectory(char *path, int capacity);   // platform_services.h
 // (a long load: the window kept answering)
 static void PlatformLoadProgress(const char *) { SDL_PumpEvents(); }
@@ -1832,6 +1838,29 @@ void flush_lights();
 // 30 frames drawn at most (60 shown), fewer than without it.
 bool frame_gen_on() { return false; }
 
+#if !defined(__APPLE__)
+// Windows and Linux: NVIDIA DLSS in place of AMD FSR2, when the library was
+// built with the DLSS SDK and the GPU runs it. THIEF_RT_UPSCALER=fsr2 keeps
+// FSR2; THIEF_RT_RR=1 has DLSS Ray Reconstruction denoise as it upscales.
+bool dlss_wanted()
+{
+   static int s_on = -1;
+   if (s_on < 0) {
+      const char *want = getenv("THIEF_RT_UPSCALER");
+      const char *why = nullptr;
+      s_on = (!want || strcasecmp(want, "fsr2") != 0) && rt.rgUtilIsUpscaleTechniqueAvailable &&
+                   rt.rgUtilIsUpscaleTechniqueAvailable(RG_RENDER_UPSCALE_TECHNIQUE_NVIDIA_DLSS,
+                                                        RG_FRAME_GENERATION_MODE_OFF, &why)
+                ? 1 : 0;
+      if (s_on || !why)
+         fprintf(stderr, "RT: upscaler %s\n", s_on ? "NVIDIA DLSS" : "AMD FSR2");
+      else
+         fprintf(stderr, "RT: upscaler AMD FSR2 (DLSS: %s)\n", why);
+   }
+   return s_on == 1;
+}
+#endif
+
 bool metalfx_denoiser_available()
 {
    return rt.rgUtilGetSupportedFeatures &&
@@ -1893,6 +1922,12 @@ void start_frame()
       // on Metal the AMD FSR2 slot is the MetalFX temporal scaler
       resolution.upscaleTechnique = RG_RENDER_UPSCALE_TECHNIQUE_AMD_FSR2;
       resolution.sharpenTechnique = RG_RENDER_SHARPEN_TECHNIQUE_AMD_CAS;
+#if !defined(__APPLE__)
+      if (dlss_wanted()) {
+         resolution.upscaleTechnique = RG_RENDER_UPSCALE_TECHNIQUE_NVIDIA_DLSS;
+         resolution.rayReconstruction = env_float("THIEF_RT_RR", 0) != 0;
+      }
+#endif
       if (g_cfg.upscale == 5) {
          resolution.resolutionMode = RG_RENDER_RESOLUTION_MODE_CUSTOM;
          resolution.customRenderSize = custom;
@@ -5306,12 +5341,17 @@ void render_size(int &w, int &h)
    h = std::max(1, int(g_drawableH * f));
 }
 
+#if defined(__APPLE__)
+#define RT_UPSCALER_NAME "MetalFX "
+#else
+#define RT_UPSCALER_NAME ""   // DLSS or FSR2 (dlss_wanted)
+#endif
 const char *kUpscaleNames[] = {"Off",
-                               "MetalFX Quality",
-                               "MetalFX Balanced",
-                               "MetalFX Performance",
-                               "MetalFX Ultra Performance",
-                               "MetalFX Custom"};
+                               RT_UPSCALER_NAME "Quality",
+                               RT_UPSCALER_NAME "Balanced",
+                               RT_UPSCALER_NAME "Performance",
+                               RT_UPSCALER_NAME "Ultra Performance",
+                               RT_UPSCALER_NAME "Custom"};
 
 enum UiRow {
    kRowPreset, kRowUpscale, kRowScale, kRowOutput, kRowDynres, kRowBounces, kRowReach, kRowLights, kRowLightFade, kRowCandidates, kRowNeighbours, kRowLightCull, kRowResponse, kRowFlicker, kRowVolumetric, kRowShafts, kRowFog, kRowFogLit, kRowFogQuality, kRowSmoke, kRowPlayerBody, kRowPlayerLegs, kRowShadowAlert, kRowTestMirror, kRowBloom, kRowVsync, kRowFrameCap,

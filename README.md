@@ -42,6 +42,7 @@ Project*, *Thief Gold*, or *Thief II: The Metal Age* is required.
   - [macOS](#macos)
   - [Linux](#linux)
   - [Android](#android)
+  - [Optional path tracer](#optional-path-tracer)
 - [Legacy OSM diagnostics](#legacy-osm-diagnostics)
 - [Content selection and diagnostics](#content-selection-and-diagnostics)
 - [Game saves](#game-saves)
@@ -562,6 +563,15 @@ or built-in gamepads remain active together.
 
 See [`docs/android.md`](docs/android.md) for installation, storage modes,
 direct-mission debugging, and touch-control details.
+
+### Optional path tracer
+
+An optional real-time path tracer (RTGL1) can render the game instead of the
+Vulkan renderer on Windows x64 with a ray-tracing GPU and on Apple silicon
+Macs. It is compiled in only when `DARK_RTGL1_INCLUDE` is set, and used only
+when the game is started with `THIEF_RT=1`. On Windows,
+`tools\rt\build-windows.ps1` builds it, the game, and the `rt` folder the
+game loads it from. See [docs/path-tracer.md](docs/path-tracer.md).
 
 ## Legacy OSM diagnostics
 

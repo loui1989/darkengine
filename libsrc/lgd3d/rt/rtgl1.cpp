@@ -245,7 +245,11 @@ struct Settings {
    bool wallOffset = true;    // flat things flush on walls moved off them a little (no speckle)
    float heatHaze = 1.0f;     // the air over torches and fires shimmers (0 off)
    float smoke = 1.0f;        // smoke and steam particles as volumetric smoke, at this density (0: flat sprites)
+#ifdef __APPLE__
    int playerBody = 1;        // Garrett's own model: his shadow, and him in mirrors and water (unseen by the camera)
+#else
+   int playerBody = 0;        // (off by default here until the body double's motion is fixed on this engine)
+#endif
    bool playerLegs = false;   // ...him seen too: his legs and feet looking down, and him in mirrors and
                               // water (off: his shadow only -- the player's call, Nov 2026)
    int shadowAlert = 0;       // the guards notice his shadow (g_PlayerShadowAlert, objlight.c)

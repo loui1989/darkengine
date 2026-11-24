@@ -5343,6 +5343,14 @@ void render_size(int &w, int &h)
    h = std::max(1, int(g_drawableH * f));
 }
 
+// the panel's shortcuts: Cmd on a Mac, Ctrl elsewhere (the Windows key's own)
+#if defined(__APPLE__)
+#define RT_MOD_KEY SDL_KMOD_GUI
+#define RT_MOD_NAME "Cmd"
+#else
+#define RT_MOD_KEY SDL_KMOD_CTRL
+#define RT_MOD_NAME "Ctrl"
+#endif
 #if defined(__APPLE__)
 #define RT_UPSCALER_NAME "MetalFX "
 #else
@@ -6367,7 +6375,11 @@ void draw_ui(bool scene)
    }
 
    if (hint && !g_ui.open) {
+#if defined(__APPLE__)
       const char *msg = "Cmd+,  or  F10: ray tracing settings";
+#else
+      const char *msg = "F10: ray tracing settings";
+#endif
       const float s = std::round(px * 0.8f);
       const float tw = text_width(s, msg);
       const float x = (g_drawableW - tw) * 0.5f, y = g_drawableH - s * 3.0f;
@@ -6436,7 +6448,7 @@ void draw_ui(bool scene)
          text(fg, x0 + 2 * pad, y, ms, "... more below (Down / Page Down)", dim);
       y += rowH * 1.25f;
       const float s = std::round(px * 0.75f);
-      text(fg, x0 + 2 * pad, y, s, "Up/Down: choose  Left/Right: change  Esc: close  Cmd+I: inspect", dim);
+      text(fg, x0 + 2 * pad, y, s, "Up/Down: choose  Left/Right: change  Esc: close  " RT_MOD_NAME "+I: inspect", dim);
       if (statusShown)
          text(fg, x0 + 2 * pad, y + rowH, s, g_ui.status.c_str(), gold);
    }
@@ -7536,7 +7548,7 @@ bool HandleKey(int scancode, int mods, bool down, bool repeat)
    if (!g_active)
       return false;
    const bool toggle = scancode == SDL_SCANCODE_F10 ||
-                       (scancode == SDL_SCANCODE_COMMA && (mods & SDL_KMOD_GUI));
+                       (scancode == SDL_SCANCODE_COMMA && (mods & RT_MOD_KEY));
    if (toggle) {
       if (down && !repeat) {
          g_ui.open = !g_ui.open;
@@ -7547,7 +7559,7 @@ bool HandleKey(int scancode, int mods, bool down, bool repeat)
    }
    // Cmd+I: inspect what is at the centre of the view without the panel
    // (which covers the centre) being open.
-   if (scancode == SDL_SCANCODE_I && (mods & SDL_KMOD_GUI)) {
+   if (scancode == SDL_SCANCODE_I && (mods & RT_MOD_KEY)) {
       if (down && !repeat)
          inspect_view();
       return true;

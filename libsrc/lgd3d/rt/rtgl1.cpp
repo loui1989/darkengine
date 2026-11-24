@@ -41,9 +41,7 @@
 #include <windows.h>
 #else
 #define RG_USE_SURFACE_XLIB
-#if __has_include(<wayland-client.h>)
-#define RG_USE_SURFACE_WAYLAND
-#endif
+#define RG_XLIB_FORWARD_TYPES   // (X11's and Wayland's headers clash with the engine's macros)
 #endif
 #pragma pack(push, 8)
 #include <RTGL1/RTGL1.h>

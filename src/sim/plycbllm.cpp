@@ -982,6 +982,16 @@ static BOOL BodyModelLoads(const char *name)
 }
 
 // whether an object is (of) an archetype named with this in it
+// (strcasestr is not in MSVC's C library)
+static BOOL NameHas(const char *name, const char *part)
+{
+   const size_t n = strlen(part);
+   for (; *name; ++name)
+      if (_strnicmp(name, part, n) == 0)
+         return TRUE;
+   return FALSE;
+}
+
 static BOOL BodyObjIsA(ObjID obj, const char *part)
 {
    AutoAppIPtr_(TraitManager, pTraits);
@@ -989,7 +999,7 @@ static BOOL BodyObjIsA(ObjID obj, const char *part)
    for (ObjID o = obj; o != OBJ_NULL; o = pTraits->GetArchetype(o))
    {
       const char *name = pObjSys->GetName(o);
-      if (name && strcasestr(name, part))
+      if (name && NameHas(name, part))
          return TRUE;
       if (pTraits->GetArchetype(o) == o)
          break;

@@ -71,6 +71,9 @@ Step "RTGL1 ($Rtgl1)"
 if (-not (Test-Path (Join-Path $Rtgl1 "CMakeLists.txt"))) {
   Invoke-Checked git @("clone", "--recursive", "--branch", "thief", "https://github.com/loui1989/RayTracedGL1", $Rtgl1)
 } else {
+  # (the thief branch's fixes: brought in when the checkout is on it)
+  $Branch = (& git -C $Rtgl1 rev-parse --abbrev-ref HEAD).Trim()
+  if ($Branch -eq "thief") { Invoke-Checked git @("-C", $Rtgl1, "pull", "--ff-only") }
   Invoke-Checked git @("-C", $Rtgl1, "submodule", "update", "--init", "--recursive")
 }
 

@@ -930,9 +930,9 @@ void run_job(MatJob &j)
    // across, and an HD pack's 2048 textures cost their upload (a hitch) and
    // 16 MB each for detail it never shows
    if (std::max(j.w, j.h) > kAlbedoMax) {
-      std::vector<uint8_t> small;
+      std::vector<uint8_t> shrunk;
       const uint8_t *src = j.creviced.empty() ? j.rgba : j.creviced.data();
-      const uint8_t *out = rtmat::shrink(src, j.w, j.h, kAlbedoMax, small, j.cw, j.ch);
+      const uint8_t *out = rtmat::shrink(src, j.w, j.h, kAlbedoMax, shrunk, j.cw, j.ch);
       j.creviced.assign(out, out + size_t(j.cw) * j.ch * 4);
    }
 }
@@ -1345,13 +1345,13 @@ const char *texture_name(RtTexture *t)
             sh = std::max(1, sh / 2);
             step *= 2;
          }
-         std::vector<uint8_t> small(size_t(sw) * sh * 4);
+         std::vector<uint8_t> shrunk(size_t(sw) * sh * 4);
          for (int y = 0; y < sh; ++y)
             for (int x = 0; x < sw; ++x)
-               memcpy(&small[(size_t(y) * sw + x) * 4],
+               memcpy(&shrunk[(size_t(y) * sw + x) * 4],
                       &t->rgba[(size_t(std::min(y * step, t->height - 1)) * t->width +
                                 std::min(x * step, t->width - 1)) * 4], 4);
-         provide_texture(t, plain, small.data(), sw, sh);
+         provide_texture(t, plain, shrunk.data(), sw, sh);
       } else {
          provide_texture(t, plain, t->rgba.data(), t->width, t->height);
       }

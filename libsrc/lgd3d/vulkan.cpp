@@ -725,8 +725,9 @@ void cVulkanRuntime::PresentRect(const void *pixels, int width, int height,
       darkrt::SetCanvas(pixels, width, height, rowBytes, depth, palette,
          RenderBackendVulkanSceneActive() != 0, RTCanvasViewport());
       m_rtPresentPending = true;
-      // out of a frame (a menu's, the loading screen's): shown now
-      if (!m_frameActive)
+      // out of a frame (a menu's, the loading screen's): shown now -- unless
+      // the path tracer's own frame is being built (it is shown at its end)
+      if (!m_frameActive && !darkrt::FrameInProgress())
          PathTracerPresent();
       return;
    }
@@ -934,7 +935,7 @@ darkrt::Rect cVulkanRuntime::RTCanvasViewport() const
 
 void cVulkanRuntime::PathTracerPresent()
 {
-   if (!m_rtPresentPending || darkrt::FrameInProgress())
+   if (!m_rtPresentPending)
       return;
    int vsync = 1;
    config_get_int("vsync", &vsync);

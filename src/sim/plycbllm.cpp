@@ -1620,6 +1620,18 @@ static void PlayerBodyUpdate(ulong dt)
    // (its height always this: kept at its motion's own, as the creature
    // system keeps a sitter's against small moves, a running stride rose a
    // foot over each cycle and dropped back as the next began -- a pop)
+   if (!isfinite(at.x) || !isfinite(at.y) || !isfinite(at.z))
+   {
+      // (a height or a pose gone wrong -- not a number: the double left
+      // where it was, its measures started again)
+      static int s_told = 0;
+      if (s_told++ < 5)
+         mprintf("PlyrBody: its place is not a number (foot %g %g %g, butt %g)\n",
+                 foot.x, foot.y, foot.z, (double)(held ? s_heldButt : g_BodyButt));
+      g_BodyButt = 3.0f;
+      s_heldButtSet = FALSE;
+      return;
+   }
    CreatureFreeHeight(g_BodyObj);
    ObjPosUpdate(g_BodyObj, &at, &fac);
    CreatureFreeHeight(OBJ_NULL);

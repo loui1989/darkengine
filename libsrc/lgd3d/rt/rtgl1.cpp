@@ -2024,6 +2024,19 @@ bool upload(uint64_t id, const RgMeshPrimitiveInfo &prim, bool firstPerson = fal
       .animationTime = 0.0f,
       .localLightsIntensity = 1.0f,
    };
+   // (a model whose pose went wrong -- a vertex not a number: an
+   // acceleration structure built over it breaks every ray near it)
+   for (uint32_t i = 0; i < prim.vertexCount; ++i) {
+      const float *p = prim.pVertices[i].position;
+      if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
+         static int s_told = 0;
+         if (s_told++ < 5)
+            fprintf(stderr, "RT: primitive %llu (%s) has a vertex not a number: left out\n",
+                    (unsigned long long)id, prim.pTextureName ? prim.pTextureName : "");
+         ++g_frameDropped;
+         return false;
+      }
+   }
    const auto t0 = std::chrono::steady_clock::now();
    const bool ok = rt.rgUploadMeshPrimitive(&mesh, &prim) == RG_RESULT_SUCCESS;
    g_uploadLibrarySecs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

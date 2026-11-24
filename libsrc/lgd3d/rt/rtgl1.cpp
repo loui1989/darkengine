@@ -3101,6 +3101,9 @@ bool same_within(CachedObject &c, const std::vector<CapturedPrim> &cap)
    return true;
 }
 
+bool toward_sky_light(const float c[3], float r);   // (below; declared here, not
+                                                   // in the function: MSVC gives a
+                                                   // block-scope one global linkage)
 void upload_objects()
 {
    g_cachedDrawn = 0;
@@ -3115,7 +3118,6 @@ void upload_objects()
       }
       return;
    }
-   bool toward_sky_light(const float c[3], float r);   // (below)
    // A budget for the models kept out of view: the nearest first, to about
    // 30000 triangles. Each is kept within a few metres to 40 m of the camera
    // (a straight line, through floors and walls); a walk round Black

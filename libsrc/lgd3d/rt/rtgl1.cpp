@@ -1838,6 +1838,15 @@ void flush_lights();
 // 30 frames drawn at most (60 shown), fewer than without it.
 bool frame_gen_on() { return false; }
 
+// RTGL1's own debug views, for diagnosis: THIEF_RT_DEBUG_SHOW, its
+// DEBUG_SHOW_FLAG_* bits (1 motion vectors, 4 the direct light unfiltered,
+// 512 white albedo, 1024 normals)
+uint32_t debug_show_env()
+{
+   static const uint32_t s_flags = uint32_t(env_float("THIEF_RT_DEBUG_SHOW", 0));
+   return s_flags;
+}
+
 #if !defined(__APPLE__)
 // Windows and Linux: NVIDIA DLSS in place of AMD FSR2, when the library was
 // built with the DLSS SDK and the GPU runs it. THIEF_RT_UPSCALER=fsr2 keeps
@@ -6898,7 +6907,8 @@ void draw_frame(bool sceneDrawn)
       .debugRestirM = 0,
       // the panel's debug view: which part of the lighting is what
       .debugVisibility = g_cfg.debugView == 1 ? 1u : 0u,
-      .debugShowFlags = g_cfg.debugView == 2 ? 32u : g_cfg.debugView == 3 ? 64u
+      .debugShowFlags = debug_show_env() ? debug_show_env()
+                        : g_cfg.debugView == 2 ? 32u : g_cfg.debugView == 3 ? 64u
                         : g_cfg.debugView == 4 ? 128u : g_cfg.debugView == 5 ? 2u : 0u,
       .restirTemporalJitter = g_reuseTest == 2 ? 0.0f : 2.0f,
       .rrSpecularHitDistance = true,
@@ -7589,13 +7599,17 @@ bool HandleKey(int scancode, int mods, bool down, bool repeat)
          panel_pause(false);
       }
       break;
+   case SDL_SCANCODE_W:   // (W A S D too: remote desktops that keep the arrows)
    case SDL_SCANCODE_UP: g_ui.row = (g_ui.row + count - 1) % count; break;
+   case SDL_SCANCODE_S:
    case SDL_SCANCODE_DOWN: g_ui.row = (g_ui.row + 1) % count; break;
    case SDL_SCANCODE_PAGEUP: g_ui.row = std::max(g_ui.row - 10, 0); break;
    case SDL_SCANCODE_PAGEDOWN: g_ui.row = std::min(g_ui.row + 10, count - 1); break;
    case SDL_SCANCODE_HOME: g_ui.row = 0; break;
    case SDL_SCANCODE_END: g_ui.row = count - 1; break;
+   case SDL_SCANCODE_A:
    case SDL_SCANCODE_LEFT: change_row(rows[g_ui.row], -1); break;
+   case SDL_SCANCODE_D:
    case SDL_SCANCODE_RIGHT:
    case SDL_SCANCODE_RETURN:
    case SDL_SCANCODE_SPACE: change_row(rows[g_ui.row], 1); break;

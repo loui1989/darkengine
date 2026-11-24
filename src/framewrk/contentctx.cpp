@@ -171,6 +171,40 @@ static void AddPath(char* list, int size, const char* path)
    }
 }
 
+// Steam's Thief Gold ships an install.cfg written for a retail install
+// (install_path C:\Program Files (x86)\Square Enix\Thief Gold, resname_base
+// that folder's RES, ...), a folder that does not exist on the machine. An
+// absolute path under the configured install_path that is missing is looked
+// for under the selected game folder instead.
+static void JoinConfigPath(char* output, int size, const char* token)
+{
+   char install[DARK_CONTENT_MAX_PATH] = "";
+   size_t len;
+   JoinPath(output, size, gBasePath, token);
+   if (!IsAbsolutePath(token) || DirectoryExists(output) ||
+       !config_get_raw("install_path", install, sizeof(install)))
+      return;
+   Trim(install);
+   len = strlen(install);
+   while (len && (install[len - 1] == '\\' || install[len - 1] == '/'))
+      install[--len] = '\0';
+   if (!len || !IsAbsolutePath(install) || _strnicmp(token, install, len) != 0 ||
+       (token[len] && token[len] != '\\' && token[len] != '/'))
+      return;
+   {
+      char moved[DARK_CONTENT_MAX_PATH];
+      const char* rest = token + len;
+      while (*rest == '\\' || *rest == '/')
+         ++rest;
+      JoinPath(moved, sizeof(moved), gBasePath, rest);
+      if (DirectoryExists(moved))
+      {
+         strncpy(output, moved, size);
+         output[size - 1] = '\0';
+      }
+   }
+}
+
 static void AddExpandedList(char* output, int outputSize, const char* list,
                             const char* suffix)
 {
@@ -187,7 +221,7 @@ static void AddExpandedList(char* output, int outputSize, const char* list,
       char absolute[DARK_CONTENT_MAX_PATH];
       char suffixed[DARK_CONTENT_MAX_PATH];
       Trim(token);
-      JoinPath(absolute, sizeof(absolute), gBasePath, token);
+      JoinConfigPath(absolute, sizeof(absolute), token);
       JoinPath(suffixed, sizeof(suffixed), absolute, suffix);
       AddPath(output, outputSize, suffixed);
    }
@@ -217,7 +251,7 @@ static void AddLastExpandedPath(char* output, int outputSize, const char* list,
       char absolute[DARK_CONTENT_MAX_PATH];
       char suffixed[DARK_CONTENT_MAX_PATH];
       Trim(token);
-      JoinPath(absolute, sizeof(absolute), gBasePath, token);
+      JoinConfigPath(absolute, sizeof(absolute), token);
       JoinPath(suffixed, sizeof(suffixed), absolute, suffix);
       if (DirectoryExists(suffixed))
       {

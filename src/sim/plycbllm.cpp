@@ -1177,7 +1177,7 @@ static int BodyTagValue(const cTagSet &tags, const char *type)
    for (int i = 0; i < tags.Size(); ++i)
    {
       const cTag *t = tags.GetEntry(i);
-      if (strcasecmp(t->GetType(), type) == 0)
+      if (_stricmp(t->GetType(), type) == 0)
          return t->GetIntValue();
    }
    return -1;

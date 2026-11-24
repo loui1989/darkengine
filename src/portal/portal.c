@@ -2692,7 +2692,7 @@ double g_PortalPartSeconds[6];
 static double portal_part_clock(void)
 {
    struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
+   timespec_get(&ts, TIME_UTC);   // (C11: MSVC has no clock_gettime)
    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 #define PORTAL_PART(i) do { const double now_ = portal_part_clock(); \

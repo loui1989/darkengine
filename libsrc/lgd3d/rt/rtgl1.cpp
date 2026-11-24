@@ -1969,6 +1969,18 @@ void start_frame()
       .pResultStaticSceneStatus = nullptr,
       .staticSceneAnimationTime = 0,
    };
+   {
+      // (what size the frame and its tracing are, logged when it changes)
+      static int s_w = -1, s_h = -1, s_rw = -1, s_rh = -1, s_mode = -1, s_up = -1;
+      const int rw = int(resolution.customRenderSize.width), rh = int(resolution.customRenderSize.height);
+      if (g_drawableW != s_w || g_drawableH != s_h || rw != s_rw || rh != s_rh ||
+          int(resolution.resolutionMode) != s_mode || int(resolution.upscaleTechnique) != s_up) {
+         s_w = g_drawableW, s_h = g_drawableH, s_rw = rw, s_rh = rh;
+         s_mode = int(resolution.resolutionMode), s_up = int(resolution.upscaleTechnique);
+         fprintf(stderr, "RT: frame %dx%d; resolution mode %d, upscaler %d, custom render size %dx%d (scale %.2f)\n",
+                 g_drawableW, g_drawableH, s_mode, s_up, rw, rh, g_cfg.scale);
+      }
+   }
    const double t0 = now_seconds();
    RgResult r = rt.rgStartFrame(&info);
    g_ui.waitSum += now_seconds() - t0;
@@ -8508,6 +8520,14 @@ void RenderRTSceneBegin(const float pos[3], const float fwd[3], const float left
    };
    g_cameraUploaded = rt.rgUploadCamera(&cam) == RG_RESULT_SUCCESS;
    g_inScene = g_cameraUploaded;
+   {
+      static float s_fov = -1, s_aspect = -1;
+      if (std::fabs(cam.fovYRadians - s_fov) > 1e-3f || std::fabs(cam.aspect - s_aspect) > 1e-3f) {
+         s_fov = cam.fovYRadians, s_aspect = cam.aspect;
+         fprintf(stderr, "RT: camera: vertical field of view %.1f degrees, aspect %.3f (the game's view %dx%d, zoom %.3f)\n",
+                 cam.fovYRadians * 57.29578f, cam.aspect, g_camera.width, g_camera.height, g_camera.zoom);
+      }
+   }
    g_suppress = true;
    g_RenderRTCaptureVertices = 0;
 }

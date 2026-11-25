@@ -190,6 +190,7 @@ public:
    BOOL IsFrozen() { return m_IsFrozen; }
 
    BOOL UpdateObjPosition();
+   void HealMultiped(const struct Position *pPos); // motion state gone to not-a-number: put back
 
 protected:
 

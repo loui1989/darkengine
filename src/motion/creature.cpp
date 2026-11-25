@@ -1968,6 +1968,20 @@ void cCreature::ComputeBoundingData()
          bmax->z=j->z;
    }
 
+   // (diagnosis: a joint gone to nowhere -- a rope that vanished)
+   if (!(bmin->x == bmin->x && bmin->y == bmin->y && bmin->z == bmin->z &&
+         bmax->x == bmax->x && bmax->y == bmax->y && bmax->z == bmax->z) ||
+       mx_dist_vec(bmin, bmax) > 2000.0f)
+   {
+      static int s_told = 0;
+      if (s_told < 10)
+      {
+         ++s_told;
+         mprintf("%s: its joints are nowhere: from (%g %g %g) to (%g %g %g)\n", ObjWarnName(m_ObjID),
+                 bmin->x, bmin->y, bmin->z, bmax->x, bmax->y, bmax->z);
+      }
+   }
+
    // calc radius
    mx_sub_vec(&max_off,bmax,&m_pJoints[m_iRootJoint]);
    mx_sub_vec(&min_off,bmin,&m_pJoints[m_iRootJoint]);
@@ -2055,6 +2069,21 @@ BOOL cCreature::MoveButt(const mxs_vector *pButtPos, const mxs_angvec *pAngles, 
 
    ConfigSpew("CreaturePosTrace",("%d moveButt: to %g, %g, %g, %x, mph=%d\n",m_ObjID,pButtPos->x,pButtPos->y,pButtPos->z,pAngles->tz,updatePhysics));
 
+   // told to move to "not a number" (by whatever moves it: logged, for the
+   // sitters of Black Parade's second mission): not moved
+   if (!(pButtPos->x == pButtPos->x && pButtPos->y == pButtPos->y && pButtPos->z == pButtPos->z))
+   {
+      static int s_told = 0;
+      if (s_told++ < 10)
+      {
+         mps_motion_node *mn = (mps_motion_node *) mp_get_main_motion(&m_sMultiped);
+         mprintf("%s told to move to not-a-number (motion %s): not moved\n", ObjWarnName(m_ObjID),
+                 (mn && MP_MOTNUM_FROM_NODE_HANDLE(mn->handle) < (uint)mp_num_motions)
+                    ? mp_motion_list[MP_MOTNUM_FROM_NODE_HANDLE(mn->handle)].info.name : "none");
+      }
+      return FALSE;
+   }
+
    mxs_vector new_butt_pos = *pButtPos;
 
    mx_copy_vec(&old,&m_sMultiped.global_pos);
@@ -2087,6 +2116,7 @@ BOOL cCreature::MoveButt(const mxs_vector *pButtPos, const mxs_angvec *pAngles, 
    mx_sub_vec(&d,&new_butt_pos,&old);
 
    quat_from_matrix(&dQ,&mat);
+   quat_normalize(&dQ);
    mps=m_sMultiped.main_motion.head;
    while(mps)
    {
@@ -2100,6 +2130,7 @@ BOOL cCreature::MoveButt(const mxs_vector *pButtPos, const mxs_angvec *pAngles, 
          //         mx_addeq_vec(&((mps_motion_node *)mps)->base_pos,&d);
          quat_copy(&tmp,&((mps_motion_node *)mps)->base_orient);
          quat_mul(&((mps_motion_node *)mps)->base_orient,&dQ,&tmp);
+         quat_normalize(&((mps_motion_node *)mps)->base_orient);
       }
       mps=mps->next;
    }
@@ -2257,6 +2288,18 @@ void cCreature::SlamPhysicsModels()
    if ((pModel = g_PhysModels.Get(m_ObjID)) == NULL)
       return;
 
+   // not a number: not given to physics (it fails its checks, and spreads
+   // to what it touches); the creature is put back first
+   if (!(m_sMultiped.global_pos.x == m_sMultiped.global_pos.x &&
+         m_sMultiped.global_pos.y == m_sMultiped.global_pos.y &&
+         m_sMultiped.global_pos.z == m_sMultiped.global_pos.z))
+   {
+      const Position *pPos = ObjPosGet(m_ObjID);
+      if (pPos == NULL)
+         return;
+      HealMultiped(pPos);
+   }
+
    PosPropLock++;
 
    gCrPosPropLock++;
@@ -2296,6 +2339,11 @@ void cCreature::SlamPhysicsModels()
 // Only to be called internall by creature system
 void SetCretObjPos(ObjID objID, const mxs_vector *pos, const mxs_angvec *rot)
 {
+   // (outside the world: not moved -- the assertion below stopped the game)
+   if (!(pos->x > -MAX_WORLD_SIZE && pos->x < MAX_WORLD_SIZE &&
+         pos->y > -MAX_WORLD_SIZE && pos->y < MAX_WORLD_SIZE &&
+         pos->z > -MAX_WORLD_SIZE && pos->z < MAX_WORLD_SIZE))
+      return;
    // check position is valid
    AssertMsg3(pos->x>-MAX_WORLD_SIZE&&pos->x<MAX_WORLD_SIZE&&\
       pos->y>-MAX_WORLD_SIZE&&pos->y<MAX_WORLD_SIZE,\
@@ -2310,12 +2358,126 @@ void SetCretObjPos(ObjID objID, const mxs_vector *pos, const mxs_angvec *rot)
    PosPropLock--;
 }
 
+// Not a number anywhere in v (or out of the world)?
+static BOOL VecIsBad(const mxs_vector &v)
+{
+   return !(v.x == v.x && v.y == v.y && v.z == v.z) ||
+          fabs(v.x) >= MAX_WORLD_SIZE || fabs(v.y) >= MAX_WORLD_SIZE || fabs(v.z) >= MAX_WORLD_SIZE;
+}
+
+static BOOL QuatIsBad(const quat &q)
+{
+   return !(q.w == q.w && q.x == q.x && q.y == q.y && q.z == q.z);
+}
+
+static BOOL MatIsBad(const mxs_matrix &m)
+{
+   for (int i = 0; i < 3; i++)
+      if (!(m.vec[i].x == m.vec[i].x && m.vec[i].y == m.vec[i].y && m.vec[i].z == m.vec[i].z))
+         return TRUE;
+   return FALSE;
+}
+
+// A creature whose motion went to "not a number" (Black Parade's second
+// mission has a sitter whose x and y do, every frame, once it starts): its
+// motions' start points and its facing are put back to where the object
+// is, so the next frame works from real numbers instead of carrying the bad
+// ones on for the rest of the mission -- with physics checks failing and
+// logging several times a frame.
+void cCreature::HealMultiped(const Position *pPos)
+{
+   static int s_told = 0;
+   if (s_told++ < 10)
+   {
+      mps_motion_node *mn = (mps_motion_node *) mp_get_main_motion(&m_sMultiped);
+      if (mn && mn->handle >= 0 && mn->handle < mp_num_motions)
+         mprintf("%s: motion \"%s\" frame %g (flags %x bend %g stretch %g) went to not-a-number%s%s: put back\n",
+                 ObjWarnName(m_ObjID), mp_motion_list[mn->handle].info.name, mn->frame,
+                 mn->params.flags, mn->params.bend, mn->params.stretch,
+                 VecIsBad(mn->base_pos) ? "; its start point" : "",
+                 QuatIsBad(mn->base_orient) ? "; its start facing" : "");
+      else
+         mprintf("%s: position went to not-a-number with no motion playing: put back\n", ObjWarnName(m_ObjID));
+   }
+
+   mxs_matrix facing;
+   mx_ang2mat(&facing, &pPos->fac);
+   if (MatIsBad(m_sMultiped.global_orient))
+      mx_copy_mat(&m_sMultiped.global_orient, &facing);
+   mx_copy_vec(&m_sMultiped.global_pos, &pPos->loc.vec);
+
+   for (mps_stack_node *n = m_sMultiped.main_motion.head; n; n = n->next)
+   {
+      if (n->type != MN_MOTION)
+         continue;
+      mps_motion_node *mn = (mps_motion_node *) n;
+      if (VecIsBad(mn->base_pos))
+         mx_copy_vec(&mn->base_pos, &pPos->loc.vec);
+      if (QuatIsBad(mn->base_orient) || !quat_normalize(&mn->base_orient))
+         quat_from_matrix(&mn->base_orient, &facing);
+      if (!(mn->params.bend == mn->params.bend) || fabs(mn->params.bend) > 100.0f)
+         mn->params.bend = 0;
+      if (!(mn->params.stretch == mn->params.stretch) || fabs(mn->params.stretch) > 1000.0f)
+         mn->params.stretch = 1.0f;
+      if (VecIsBad(mn->offset))
+         mx_zero_vec(&mn->offset);
+   }
+
+   // joints: moved with the body to where it is
+   for (int i = 0; i < m_nJoints; i++)
+      if (VecIsBad(m_pJoints[i]))
+         mx_copy_vec(&m_pJoints[i], &pPos->loc.vec);
+   mx_copy_vec(&m_sMultiped.rel_xlat, &m_sMultiped.global_pos);
+   ComputeBoundingData();
+}
+
 BOOL cCreature::UpdateObjPosition()
 {
    mxs_angvec fac;
 
    fac.tz = GetHeadingAngle(&m_sMultiped.global_orient);
    fac.tx = fac.ty = 0;
+
+   // A creature flung off into the void: one stuck in the world's geometry
+   // (Black Parade's Dahlquist, sitting in a wall) hit by a thrown flower
+   // was pushed out with a velocity that doubled every frame -- hundreds of
+   // feet, then hundreds of thousands, and the game stopped on an assertion.
+   // No creature moves tens of feet in one update: it stays where it was,
+   // and its physics is stopped.
+   {
+      const Position *pPos = ObjPosGet(m_ObjID);
+      const mxs_vector &np = m_sMultiped.global_pos;
+      BOOL bad = !(np.x == np.x && np.y == np.y && np.z == np.z) ||
+                 fabs(np.x) >= MAX_WORLD_SIZE || fabs(np.y) >= MAX_WORLD_SIZE ||
+                 fabs(np.z) >= MAX_WORLD_SIZE;
+      if (!bad && pPos && g_SimRunning)
+      {
+         mxs_vector d;
+         mx_sub_vec(&d, &np, &pPos->loc.vec);
+         // (a script's teleport moves it far too, but not at this speed)
+         mxs_vector vel = {0, 0, 0};
+         if (mx_mag2_vec(&d) > 40.0f * 40.0f && PhysObjHasPhysics(m_ObjID))
+         {
+            PhysGetVelocity(m_ObjID, &vel);
+            bad = mx_mag2_vec(&vel) > 150.0f * 150.0f;
+         }
+      }
+      if (bad && pPos)
+      {
+         static int s_told = 0;
+         if (s_told++ < 20)
+            mprintf("%s flung to (%g %g %g) from (%g %g %g): kept where it was\n", ObjWarnName(m_ObjID),
+                    np.x, np.y, np.z, pPos->loc.vec.x, pPos->loc.vec.y, pPos->loc.vec.z);
+         if (!(np.x == np.x && np.y == np.y && np.z == np.z))
+            HealMultiped(pPos);
+         mx_copy_vec(&m_sMultiped.global_pos, &pPos->loc.vec);
+         mxs_vector zero = {0, 0, 0};
+         mxs_vector here = pPos->loc.vec;
+         PhysSetVelocity(m_ObjID, &zero);
+         PhysSetRotationalVelocity(m_ObjID, &zero);
+         PhysSetModLocation(m_ObjID, &here);
+      }
+   }
 
    SetCretObjPos(m_ObjID,&m_sMultiped.global_pos,&fac);
 

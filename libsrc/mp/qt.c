@@ -346,3 +346,19 @@ float quat_mag(quat * q)
 }
 
 //
+
+bool quat_normalize(quat * q)
+{
+	float m2 = q->w * q->w + q->x * q->x + q->y * q->y + q->z * q->z;
+	if (!(m2 > 1e-12f && m2 < 1e30f))
+	{
+		quat_identity(q);
+		return FALSE;
+	}
+	if (m2 < 0.999999f || m2 > 1.000001f)
+	{
+		float k = 1.0f / sqrtf(m2);
+		q->w *= k; q->x *= k; q->y *= k; q->z *= k;
+	}
+	return TRUE;
+}

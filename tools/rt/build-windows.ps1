@@ -144,12 +144,26 @@ if ($Dlss) {
 Copy-Item (Join-Path $Rtgl1 "Build\shaders\*.spv") (Join-Path $Rt "shaders") -Force
 Copy-Item (Join-Path $Rtgl1 "Tools\*.ktx2") $Rt -Force
 Copy-Item (Join-Path $Repo "assets\rt\glass\*.png") (Join-Path $Rt "glass") -Force
+# developerMode: RTGL1 loads the material maps the game makes (rt\mat_dev, PNG)
+# only with it on -- off, only pre-compressed KTX2: no bumps, roughness or
+# crevices, and the flames' glow maps missing (each flame sprite glowing as a
+# whole square). debugWindows keeps its debug window off.
 $Json = Join-Path $Rt "RTGL1.json"
-if (-not (Test-Path $Json)) {
+if (Test-Path $Json) {
+  $Text = Get-Content -Raw $Json
+  if ($Text -match '"developerMode"\s*:\s*false') {
+    $Text = $Text -replace '"developerMode"\s*:\s*false', '"developerMode": true'
+    if ($Text -notmatch '"debugWindows"') {
+      $Text = $Text -replace '"developerMode": true', ('"developerMode": true,' + "`n" + '  "debugWindows": false')
+    }
+    Set-Content -Path $Json -Encoding ascii -Value $Text
+    Write-Host "RTGL1.json: developerMode turned on (the game's material maps)"
+  }
+} else {
   Set-Content -Path $Json -Encoding ascii -Value @'
 {
   "version": 0,
-  "developerMode": false,
+  "developerMode": true,
   "debugWindows": false,
   "vulkanValidation": false,
   "dx12Validation": false,

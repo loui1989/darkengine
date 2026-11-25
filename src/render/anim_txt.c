@@ -193,10 +193,23 @@ BOOL ectsAnimRefresh(IRes *pRes, sAnimTexProp *newvals)
    animData = GetResAnimData(pRes);
    if (!animData) return FALSE;
    {
+      // A material that forces its animation settings wins over the property.
+      // Applied here from the new values, not by ectsAnimConfigure: that looks
+      // the texture's object up, and this runs while that object is being
+      // created (the property's listener), so it made another, and another --
+      // without end (the HD Mod's animated water, waterhw/grin).
       const sTextureMaterial *material = ResMaterialGet((grs_bitmap *)IRes_DataPeek(pRes));
       if (material && material->forceAnimation == 1)
       {
-         ectsAnimConfigure(animData);
+         sAnimTexProp authored = *newvals;
+         if (material->animationRate > 0)
+            authored.rate = material->animationRate;
+         if (material->animationMode >= 0)
+            authored.flags = material->animationMode;
+         newvals = &authored;
+         animData->rate = newvals->rate > 0 ? newvals->rate : DEF_RATE;
+         animData->flags=(animData->flags&FLAGS_RUNTIME)|(newvals->flags&FLAGS_PROP);
+         animData->flags &= ~FLAG_CONFIGURE_ME;
          return TRUE;
       }
    }

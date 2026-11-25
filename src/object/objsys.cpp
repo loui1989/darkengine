@@ -5,6 +5,7 @@
 
 // $Header: r:/t2repos/thief2/src/object/objsys.cpp,v 1.91 2000/03/07 19:57:45 toml Exp $
 #include <appagg.h>
+#include <stdio.h>
 #include <algorithm>
 #include <constrid.h>
 #include <aggmemb.h>
@@ -95,6 +96,9 @@ struct sObjCreateTime
 #define TIME_STACK_DEPTH 32
 static sObjCreateTime gTimeStack[TIME_STACK_DEPTH];
 static int gTimeStackTop = 0;
+// creations nested past the timing stack's depth are counted, not timed (an
+// overflow wrote past the array; the cause is logged by BeginCreate)
+static int gTimeStackOver = 0;
 
 EXTERN void ResetObjTimerStats()
 {
@@ -106,12 +110,16 @@ EXTERN void ResetObjTimerStats()
 
    gNumCreates = gTotalCreateTime = 0;
    gTimeStackTop = 0;
+   gTimeStackOver = 0;
 }
 
 static void PushTimer()
 {
-   Assert_(gTimeStackTop < TIME_STACK_DEPTH);
-
+   if (gTimeStackTop >= TIME_STACK_DEPTH)
+   {
+      gTimeStackOver++;
+      return;
+   }
    sObjCreateTime& time = gTimeStack[gTimeStackTop++];
    time.stamp = 0;
    time.accum = 0;
@@ -119,11 +127,16 @@ static void PushTimer()
 
 static void PopTimer()
 {
-   gTimeStackTop--;
+   if (gTimeStackOver > 0)
+      gTimeStackOver--;
+   else if (gTimeStackTop > 0)
+      gTimeStackTop--;
 }
 
 static void StartTimer()
 {
+   if (gTimeStackTop <= 0)
+      return;
    gTimeStack[gTimeStackTop-1].stamp = tm_get_millisec_unrecorded();
 }
 
@@ -131,6 +144,8 @@ static void StartTimer()
 // Creepy that this is the same thing
 static void StopTimer()
 {
+   if (gTimeStackTop <= 0)
+      return;
    sObjCreateTime& time = gTimeStack[gTimeStackTop-1];
 
    ulong delta = tm_get_millisec_unrecorded() - time.stamp;
@@ -141,6 +156,8 @@ static void StopTimer()
 // Warn if this is unusual
 static void AccumTimerStats(ObjID obj)
 {
+   if (gTimeStackTop <= 0)
+      return;
    sObjCreateTime& time = gTimeStack[gTimeStackTop-1];
 
    ulong t = time.accum;
@@ -419,6 +436,19 @@ STDMETHODIMP_(ObjID) cObjectSystem::BeginCreate(ObjID exemplar, eObjConcreteness
 {
    PushTimer();
    StartTimer();
+
+#ifdef PLAYTEST
+   // object creations nested this deep: a chain of objects creating objects,
+   // or a creation begun and never ended (logged, to find which)
+   static int s_deepLogged = 0;
+   if (gTimeStackTop + gTimeStackOver >= TIME_STACK_DEPTH - 4 && s_deepLogged < 200)
+   {
+      s_deepLogged++;
+      fprintf(stderr, "ObjSys: object creation nested %d deep: an object of %d (%s)\n", gTimeStackTop + gTimeStackOver,
+              exemplar, exemplar != OBJ_NULL && ObjExists(exemplar) ? GetName(exemplar) : "-");
+      fflush(stderr);
+   }
+#endif
 
    Lock();
    ObjID archetype = exemplar;

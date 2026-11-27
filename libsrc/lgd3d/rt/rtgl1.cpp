@@ -242,6 +242,13 @@ struct Settings {
    bool torchShadows = true;
    bool wallOffset = true;    // flat things flush on walls moved off them a little (no speckle)
    float heatHaze = 1.0f;     // the air over torches and fires shimmers (0 off)
+   // how brightly the object you can reach and use glows (the game's highlight,
+   // highlight_level, times this): fainter through RTGL1's Vulkan backend
+#ifdef __APPLE__
+   float highlight = 0.7f;
+#else
+   float highlight = 1.1f;
+#endif
    float smoke = 1.0f;        // smoke and steam particles as volumetric smoke, at this density (0: flat sprites)
 #ifdef __APPLE__
    int playerBody = 1;        // Garrett's own model: his shadow, and him in mirrors and water (unseen by the camera)
@@ -476,6 +483,7 @@ void load_settings()
       else if (k == "underwater_haze") g_cfg.underwaterHaze = std::clamp(value, 0.0f, 4.0f);
       else if (k == "underwater_brighter") g_cfg.underwaterLift = std::clamp(value, 0.0f, 3.0f);
       else if (k == "heat_haze") g_cfg.heatHaze = std::clamp(value, 0.0f, 3.0f);
+      else if (k == "highlight") g_cfg.highlight = std::clamp(value, 0.0f, 4.0f);
       else if (k == "volumetric_smoke") g_cfg.smoke = std::clamp(value, 0.0f, 4.0f);
       // (the test, the double shown ahead of you, is never kept: on)
       else if (k == "player_body") g_cfg.playerBody = std::clamp(int(value), 0, 1);
@@ -3408,7 +3416,7 @@ void upload_objects()
          c.splitValid = false;
       }
       g_uploadHighlight = (highlit_obj != 0 && uint32_t(highlit_obj) == obj)
-                             ? std::clamp(objlight_highlight_level, 0.0f, 1.0f) * 0.7f
+                             ? std::clamp(objlight_highlight_level, 0.0f, 1.0f) * g_cfg.highlight
                              : 0.0f;
       // A lamp's glowing parts follow its light: switched off (a light
       // switch, a doused torch), they go dark with it; dimmed or flickering,

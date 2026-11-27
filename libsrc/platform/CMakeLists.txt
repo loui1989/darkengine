@@ -18,7 +18,7 @@ target_compile_definitions(dark_platform INTERFACE
 )
 
 target_link_libraries(dark_platform PUBLIC
-  $<$<PLATFORM_ID:Windows>:advapi32 user32 ws2_32>
+  $<$<PLATFORM_ID:Windows>:advapi32 user32 ws2_32 dbghelp>
   ${CMAKE_DL_LIBS}
 )
 

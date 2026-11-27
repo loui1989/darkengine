@@ -120,6 +120,11 @@ if (-not $SkipGame) {
   Invoke-Checked git @("-C", $Repo, "submodule", "update", "--init", "--recursive")
   Invoke-Checked cmake (@("-S", $Repo, "-B", $Build) + $Gen + @(
     "-A", "x64",
+    # symbols for a release build (a .pdb beside thief-runner.exe): a crash
+    # then names its functions and source lines in the log
+    "-DCMAKE_C_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /Z7",
+    "-DCMAKE_CXX_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /Z7",
+    "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=/DEBUG /OPT:REF /OPT:ICF /INCREMENTAL:NO",
     "-DDARK_RTGL1_INCLUDE=$(Join-Path $Rtgl1 'Include')"))
   Invoke-Checked cmake @("--build", $Build, "--config", "Release", "--target", "thief2", "--parallel")
 }

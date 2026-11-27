@@ -96,6 +96,12 @@ the data files as above.
   render resolution, and the lighting, fog, material and light-gem options.
   They are saved to `rt_settings.txt` in the game's settings folder
   (`%APPDATA%\Dark Engine Restored` on Windows).
+  A few are only read from that file, not shown in the panel:
+  `highlight` (how brightly the object you can use glows, 1.1 by default),
+  `heat_haze` (the shimmer over fires, 0 off).
+- A crash writes its call stack, with function names and source lines, to the
+  log and to `darkengine-diagnostics.log` in the game folder (the Windows build
+  script keeps the symbols, `thief-runner.pdb`, beside the executable).
 - `THIEF_RT_UPSCALER=fsr2` keeps AMD FSR2 when DLSS is available;
   `THIEF_RT_RR=1` turns on DLSS Ray Reconstruction.
 - The material maps are made from the game's textures the first time each one

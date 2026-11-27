@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <conio.h>
+#include <dbghelp.h>
 #include <malloc.h>
 #include <mutex>
 #include <string>
@@ -416,6 +417,96 @@ void PlatformDiagnosticsLogStack(const char *severity, const char *subsystem,
 
 static volatile LONG gPlatformCrashReported;
 
+// The crashed thread's stack from its own context, with function names and
+// source lines where the build has symbols (a .pdb beside the .exe): to the
+// log (stderr) and the diagnostics report.
+static void PlatformLogCrashStack(EXCEPTION_POINTERS *exceptionInfo)
+{
+   if (!exceptionInfo || !exceptionInfo->ContextRecord)
+      return;
+   HANDLE process = GetCurrentProcess();
+   HANDLE thread = GetCurrentThread();
+   SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+   const BOOL symbols = SymInitialize(process, NULL, TRUE);
+
+   CONTEXT context = *exceptionInfo->ContextRecord;
+   STACKFRAME64 frame = {};
+#if defined(_M_X64)
+   const DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+   frame.AddrPC.Offset = context.Rip;
+   frame.AddrFrame.Offset = context.Rbp;
+   frame.AddrStack.Offset = context.Rsp;
+#else
+   const DWORD machine = IMAGE_FILE_MACHINE_I386;
+   frame.AddrPC.Offset = context.Eip;
+   frame.AddrFrame.Offset = context.Ebp;
+   frame.AddrStack.Offset = context.Esp;
+#endif
+   frame.AddrPC.Mode = AddrModeFlat;
+   frame.AddrFrame.Mode = AddrModeFlat;
+   frame.AddrStack.Mode = AddrModeFlat;
+
+   fprintf(stderr, "CRASH: the stack where it happened%s:\n",
+           symbols ? "" : " (no symbols)");
+   for (int i = 0; i < 40; ++i)
+   {
+      if (!StackWalk64(machine, process, thread, &frame, &context, NULL,
+                       SymFunctionTableAccess64, SymGetModuleBase64, NULL))
+         break;
+      const DWORD64 pc = frame.AddrPC.Offset;
+      if (pc == 0)
+         break;
+
+      char line[512];
+      int used = _snprintf(line, sizeof(line) - 1, "  #%02d %p", i, (void *)pc);
+      if (used < 0)
+         used = 0;
+
+      char module[MAX_PATH] = "?";
+      const DWORD64 base = SymGetModuleBase64(process, pc);
+      if (base && GetModuleFileNameA((HMODULE)base, module, sizeof(module)))
+      {
+         const char *slash = strrchr(module, '\\');
+         int n = _snprintf(line + used, sizeof(line) - used - 1, " %s+0x%llx",
+                           slash ? slash + 1 : module,
+                           (unsigned long long)(pc - base));
+         if (n > 0)
+            used += n;
+      }
+
+      alignas(SYMBOL_INFO) char symbolBuffer[sizeof(SYMBOL_INFO) + 256] = {};
+      SYMBOL_INFO *symbol = (SYMBOL_INFO *)symbolBuffer;
+      symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+      symbol->MaxNameLen = 255;
+      DWORD64 displacement = 0;
+      if (symbols && SymFromAddr(process, pc, &displacement, symbol))
+      {
+         int n = _snprintf(line + used, sizeof(line) - used - 1, " %s+0x%llx",
+                           symbol->Name, (unsigned long long)displacement);
+         if (n > 0)
+            used += n;
+      }
+      IMAGEHLP_LINE64 source = {};
+      source.SizeOfStruct = sizeof(source);
+      DWORD lineDisplacement = 0;
+      if (symbols && SymGetLineFromAddr64(process, pc, &lineDisplacement, &source))
+      {
+         const char *slash = strrchr(source.FileName, '\\');
+         int n = _snprintf(line + used, sizeof(line) - used - 1, " (%s:%lu)",
+                           slash ? slash + 1 : source.FileName,
+                           (unsigned long)source.LineNumber);
+         if (n > 0)
+            used += n;
+      }
+      line[sizeof(line) - 1] = '\0';
+      fprintf(stderr, "%s\n", line);
+      PlatformDiagnosticsLog("FATAL", "crash", line);
+   }
+   fflush(stderr);
+   if (symbols)
+      SymCleanup(process);
+}
+
 static LONG WINAPI PlatformUnhandledExceptionFilter(
    EXCEPTION_POINTERS *exceptionInfo)
 {
@@ -431,7 +522,8 @@ static LONG WINAPI PlatformUnhandledExceptionFilter(
                 (unsigned long)code,address);
       message[sizeof(message) - 1] = '\0';
       PlatformDiagnosticsLog("FATAL","crash",message);
-      PlatformDiagnosticsLogStack("FATAL","crash",1);
+      fprintf(stderr, "CRASH: %s\n", message);
+      PlatformLogCrashStack(exceptionInfo);
    }
    return EXCEPTION_CONTINUE_SEARCH;
 }
